@@ -1020,3 +1020,131 @@ class TestSessionAndTokenRevocation:
         # INNER JOIN users in _verify_api_token must reject it with 401.
         resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
         assert resp.status_code == 401, resp.text
+
+
+# ── GitHub allowed-domains (Vuln 7: fail-closed regression) ──────────────
+
+class TestGithubAllowedDomains:
+    """GitHub branch of oauth_callback must fail closed when the user has no
+    public email: fetch /user/emails (already-requested user:email scope) and
+    pick the primary+verified entry, then enforce OAUTH_ALLOWED_DOMAINS against
+    it. Previously the `and domain` guard short-circuited on empty email and
+    admitted anyone whenever the allow-list was set."""
+
+    def _enable(self, monkeypatch):
+        m = _main_module()
+        monkeypatch.setattr(m, "OAUTH_GITHUB_CLIENT_ID", "gh-client-id")
+        monkeypatch.setattr(m, "OAUTH_GITHUB_CLIENT_SECRET", "gh-secret")
+        monkeypatch.setattr(m, "OAUTH_DEFAULT_ROLE", "viewer")
+        monkeypatch.setattr(m, "OAUTH_ALLOWED_DOMAINS", ["allowed.example"])
+        return m
+
+    def _stub_token(self, monkeypatch):
+        from types import SimpleNamespace
+        monkeypatch.setattr(
+            "httpx.post",
+            lambda *a, **k: SimpleNamespace(status_code=200,
+                                            json=lambda: {"access_token": "gh-tok"}))
+
+    def _stub_get(self, monkeypatch, user_payload, emails_payload):
+        """Route /user vs /user/emails by URL; return SimpleNamespace fakes."""
+        from types import SimpleNamespace
+
+        def _get(url, *a, **k):
+            if url == "https://api.github.com/user":
+                return SimpleNamespace(status_code=200, json=lambda: user_payload)
+            if url == "https://api.github.com/user/emails":
+                return SimpleNamespace(status_code=200, json=lambda: emails_payload)
+            return SimpleNamespace(status_code=404, json=lambda: {})
+
+        monkeypatch.setattr("httpx.get", _get)
+
+    def test_github_public_email_allowed_domain_admitted(self, app, monkeypatch):
+        """A user whose public /user email is in the allow-list is admitted and
+        gets a session cookie — /user/emails is not needed."""
+        m = self._enable(monkeypatch)
+        self._stub_token(monkeypatch)
+        self._stub_get(monkeypatch,
+                       user_payload={"login": "gh-alice", "email": "alice@allowed.example"},
+                       emails_payload=[])
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/github/callback?code=abc",
+                         follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert resp.headers["location"] == "/"
+            assert resp.cookies.get("access_token"), "session cookie must be set"
+
+    def test_github_no_public_email_fetched_from_emails_allowed(self, app, monkeypatch):
+        """When /user has email=null, the primary+verified address from
+        /user/emails is used and admission proceeds when it matches the
+        allow-list."""
+        m = self._enable(monkeypatch)
+        self._stub_token(monkeypatch)
+        self._stub_get(monkeypatch,
+                       user_payload={"login": "gh-bob", "email": None},
+                       emails_payload=[
+                           {"email": "bob@other.example", "primary": False, "verified": True},
+                           {"email": "bob@allowed.example", "primary": True, "verified": True},
+                       ])
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/github/callback?code=abc",
+                         follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert resp.headers["location"] == "/"
+            assert resp.cookies.get("access_token"), "session cookie must be set"
+
+    def test_github_no_public_email_fail_closed_rejected(self, app, monkeypatch):
+        """REGRESSION for V7: with no public email and a /user/emails address
+        outside the allow-list, the user must be rejected. Previously the
+        `and domain` guard short-circuited on empty email and admitted anyone."""
+        m = self._enable(monkeypatch)
+        self._stub_token(monkeypatch)
+        self._stub_get(monkeypatch,
+                       user_payload={"login": "gh-eve", "email": None},
+                       emails_payload=[
+                           {"email": "eve@evil.example", "primary": True, "verified": True},
+                       ])
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/github/callback?code=abc",
+                         follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert "error=domain_not_allowed" in resp.headers["location"]
+            assert not resp.cookies.get("access_token"), "must NOT issue a session cookie"
+
+    def test_github_emails_all_unverified_rejected(self, app, monkeypatch):
+        """An allowed-domain address that is primary but NOT verified must not
+        satisfy the check — only primary+verified entries are trusted, so the
+        user is rejected here."""
+        m = self._enable(monkeypatch)
+        self._stub_token(monkeypatch)
+        self._stub_get(monkeypatch,
+                       user_payload={"login": "gh-mallory", "email": None},
+                       emails_payload=[
+                           {"email": "mallory@allowed.example", "primary": True, "verified": False},
+                       ])
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/github/callback?code=abc",
+                         follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert "error=domain_not_allowed" in resp.headers["location"]
+            assert not resp.cookies.get("access_token"), "must NOT issue a session cookie"
+
+    def test_github_no_public_email_empty_emails_response_fail_closed(self, app, monkeypatch):
+        """REGRESSION for V7 (empty-email path, isolated): when /user has no
+        public email AND the /user/emails response yields no usable address
+        (empty list — no verified entries, or scope wasn't granted), email stays
+        empty and domain becomes "". With OAUTH_ALLOWED_DOMAINS set, the user
+        must be rejected fail-closed. The V7 bug (`and domain` short-circuit)
+        would admit this user because `domain == ""` is falsy; the fix makes
+        `"" not in OAUTH_ALLOWED_DOMAINS` True → rejected."""
+        m = self._enable(monkeypatch)
+        self._stub_token(monkeypatch)
+        self._stub_get(monkeypatch,
+                       user_payload={"login": "gh-nobody", "email": None},
+                       emails_payload=[])
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/github/callback?code=abc",
+                         follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert "error=domain_not_allowed" in resp.headers["location"]
+            assert not resp.cookies.get("access_token"), "must NOT issue a session cookie"

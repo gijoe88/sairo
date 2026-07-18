@@ -3744,9 +3744,23 @@ def oauth_callback(provider: str, code: str, request: Request):
         gh_user = user_resp.json()
         username = gh_user.get("login", "unknown")
         email = gh_user.get("email") or ""
+        # GitHub's /user returns email=null when the address is private; the
+        # user:email scope is already requested, so fall back to /user/emails.
+        if not email:
+            try:
+                emails_resp = httpx.get("https://api.github.com/user/emails",
+                                        headers={"Authorization": f"Bearer {access_token}",
+                                                 "Accept": "application/json"})
+                if emails_resp.status_code == 200:
+                    for entry in emails_resp.json() or []:
+                        if entry.get("primary") and entry.get("verified"):
+                            email = entry.get("email") or ""
+                            break
+            except Exception:
+                pass
         domain = email.split("@")[1] if "@" in email else ""
 
-        if OAUTH_ALLOWED_DOMAINS and domain and domain not in OAUTH_ALLOWED_DOMAINS:
+        if OAUTH_ALLOWED_DOMAINS and domain not in OAUTH_ALLOWED_DOMAINS:
             return RedirectResponse(f"/?error=domain_not_allowed")
     else:
         return RedirectResponse(f"/?error=unknown_provider")
