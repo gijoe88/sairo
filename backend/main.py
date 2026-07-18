@@ -33,12 +33,12 @@ import hashlib
 import base64
 from cryptography.fernet import Fernet, InvalidToken
 from slowapi import Limiter
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from pricing import (
     get_storage_pricing, get_storage_price, estimate_monthly_cost as _estimate_monthly_cost,
     detect_provider, get_all_providers, calculate_savings, STATIC_PRICING,
 )
+from trusted_proxy import TrustedProxyMiddleware, parse_trusted_proxies
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sairo")
@@ -59,7 +59,22 @@ app = FastAPI()
 RATE_LIMIT = os.environ.get("RATE_LIMIT", "120/minute")
 UPLOAD_RATE_LIMIT = os.environ.get("UPLOAD_RATE_LIMIT", "30/minute")
 
-limiter = Limiter(key_func=get_remote_address, default_limits=[RATE_LIMIT])
+# ── Trusted Proxies (X-Forwarded-* resolution) ──────────────────────────────
+# Parsed once at import so an invalid value fails fast (refuses to boot). Empty
+# when unset → TrustedProxyMiddleware is a complete no-op (existing behavior).
+TRUSTED_PROXIES = parse_trusted_proxies(os.environ.get("TRUSTED_PROXIES", ""))
+
+# Key on the ASGI-resolved client (request.client.host). TrustedProxyMiddleware
+# (outermost) rewrites scope["client"] to the real client IP when TRUSTED_PROXIES
+# is set, so the bucket is per real client behind a proxy. We intentionally do
+# NOT use slowapi.util.get_remote_address here: pinning this to request.client.host
+# makes the dependency on the resolved scope explicit and is robust against a
+# future slowapi change that might read X-Forwarded-For directly (which would
+# double-apply the XFF parse the middleware already did).
+limiter = Limiter(
+    key_func=lambda request: (request.client and request.client.host) or "unknown",
+    default_limits=[RATE_LIMIT],
+)
 app.state.limiter = limiter
 
 
@@ -211,9 +226,10 @@ async def bucket_permission_middleware(request: Request, call_next):
 
 
 # ── Multi-Endpoint URL Rewriting + S3-key session Middleware ────────────────
-# Registered LAST → OUTERMOST: runs first on the way in, so the path is rewritten and
-# the S3-key user's credentials/endpoint are bound into context BEFORE the permission
-# middleware and route handler execute.
+# Runs inside TrustedProxyMiddleware (added via add_middleware, outermost, runs
+# first) so request.client is already the resolved IP here. Runs before the
+# permission middleware and route handler, so the path is rewritten and the
+# S3-key user's credentials/endpoint are bound into context BEFORE they execute.
 
 @app.middleware("http")
 async def endpoint_routing_middleware(request: Request, call_next):
@@ -239,11 +255,15 @@ async def endpoint_routing_middleware(request: Request, call_next):
     request.state.endpoint_id = endpoint_id
     t_e = _endpoint_ctx.set(endpoint_id)
     t_u = _user_creds_ctx.set(user_creds)
+    # request.client.host is already the resolved IP here (TrustedProxyMiddleware
+    # rewrote scope["client"] on the way in); capture it so _audit can record it.
+    t_c = _client_ip_ctx.set(request.client.host if request.client else None)
     try:
         return await call_next(request)
     finally:
         _endpoint_ctx.reset(t_e)
         _user_creds_ctx.reset(t_u)
+        _client_ip_ctx.reset(t_c)
 
 
 # ── Login Rate Limiter ──────────────────────────────────────────────────────
@@ -489,6 +509,14 @@ _endpoint_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("_endpoint_c
 # sessions, API tokens, and background (crawl) threads → those keep using server creds.
 _user_creds_ctx: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("_user_creds_ctx", default=None)
 
+# Resolved client IP for the current request — set in endpoint_routing_middleware from
+# request.client.host (which TrustedProxyMiddleware has already rewritten to the real
+# client IP when TRUSTED_PROXIES is configured, and left as the direct peer otherwise).
+# _audit() reads this so every request-scoped audit row records the resolved IP without
+# needing the request threaded through ~60 call sites. None outside a request context
+# (background crawls, startup) → those audit rows store NULL.
+_client_ip_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_client_ip_ctx", default=None)
+
 # Keep thread-local as fallback for background threads that set it explicitly
 _s3_context = threading.local()
 
@@ -551,6 +579,13 @@ def _init_users_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(username)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_bucket ON audit_log(bucket)")
+    # client_ip (added for trusted-proxy client resolution; NULL for rows written
+    # before this column existed, and for audit events outside a request context).
+    for col, coldef in [("client_ip", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE audit_log ADD COLUMN {col} {coldef}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     # API tokens table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS api_tokens (
@@ -859,11 +894,12 @@ def _audit(action: str, username: str, bucket: Optional[str] = None, details: Op
     details_text = "" if details is None else str(details)
     if len(details_text) > 1000:
         details_text = details_text[:1000] + "..."
+    client_ip = _client_ip_ctx.get()  # None outside a request context → NULL
     try:
         with _get_users_db() as db:
             db.execute(
-                "INSERT INTO audit_log (timestamp, username, action, bucket, details) VALUES (?, ?, ?, ?, ?)",
-                (datetime.now(timezone.utc).isoformat(), username, action, bucket, details_text),
+                "INSERT INTO audit_log (timestamp, username, action, bucket, details, client_ip) VALUES (?, ?, ?, ?, ?, ?)",
+                (datetime.now(timezone.utc).isoformat(), username, action, bucket, details_text, client_ip),
             )
             db.commit()
         _audit_failures = 0
@@ -2480,9 +2516,11 @@ def _tel_active_buckets_24h() -> int:
 
 @app.middleware("http")
 async def telemetry_counter_middleware(request: Request, call_next):
-    """Outermost middleware — counts requests for anonymous telemetry. Strictly
-    pass-through: it never modifies the request/response and never swallows the
-    handler's exception (it re-raises after recording a failure)."""
+    """Pass-through telemetry counter — counts requests for anonymous telemetry.
+    Runs inside TrustedProxyMiddleware (which is outermost), so request.client is
+    already the resolved IP when this runs. Strictly pass-through: it never
+    modifies the request/response and never swallows the handler's exception (it
+    re-raises after recording a failure)."""
     if not TELEMETRY:
         return await call_next(request)
     try:
@@ -2498,6 +2536,17 @@ async def telemetry_counter_middleware(request: Request, call_next):
     except Exception:
         pass
     return response
+
+
+# ── Trusted Proxy Middleware (registered LAST → OUTERMOST) ───────────────────
+# Starlette's add_middleware() inserts at position 0 of user_middleware, so the
+# LAST add_middleware call becomes the OUTERMOST wrapper. Registered after every
+# @app.middleware("http") decorator above (security headers, bucket permission,
+# endpoint routing, telemetry counter) so it runs FIRST on the way in — every
+# downstream layer sees the rewritten client/scheme/host (audit-log client IP,
+# rate-limiter keys, SSO redirect URIs, request.base_url behind a proxy).
+# With TRUSTED_PROXIES unset this is a complete no-op (fail-closed default).
+app.add_middleware(TrustedProxyMiddleware, trusted_proxies=TRUSTED_PROXIES)
 
 
 def _meta_get(key: str, default=None):
@@ -4241,7 +4290,7 @@ def get_audit_log(
     with _get_users_db() as db:
         total = db.execute(f"SELECT COUNT(*) FROM audit_log {where}", params).fetchone()[0]
         rows = db.execute(
-            f"SELECT id, timestamp, username, action, bucket, details FROM audit_log {where} "
+            f"SELECT id, timestamp, username, action, bucket, details, client_ip FROM audit_log {where} "
             "ORDER BY id DESC LIMIT ? OFFSET ?",
             params + [limit, offset],
         ).fetchall()
