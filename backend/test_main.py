@@ -857,3 +857,99 @@ class TestCompatPermissions:
                          "/api/presigned-url?key=test", "/api/multipart-uploads"]:
                 resp = fresh.get(path)
                 assert resp.status_code == 401, f"{path} should require auth, got {resp.status_code}"
+
+
+# ── Audit Log client_ip (trusted-proxy resolution) ───────
+
+class TestAuditClientIp:
+    """The audit log records the resolved client IP via a request-scoped contextvar
+    set in endpoint_routing_middleware from request.client.host (already rewritten by
+    TrustedProxyMiddleware when TRUSTED_PROXIES is configured)."""
+
+    def test_audit_row_carries_client_ip(self, app):
+        """A request made from TestClient(client=("203.0.113.9", 0)) should produce
+        an audit row whose client_ip is exactly that peer IP — proving the chain
+        middleware → endpoint_routing sets _client_ip_ctx → _audit records it →
+        SELECT surfaces it. (TRUSTED_PROXIES is unset in tests, so the trusted-proxy
+        middleware is a no-op and request.client.host stays as the TestClient peer.)"""
+        # Fresh TestClient bound to a synthetic client IP, sharing the module-scoped app/DB.
+        with TestClient(app, client=("203.0.113.9", 0)) as c:
+            # Perform an audited action through THIS client so the resulting audit row
+            # carries 203.0.113.9 (admin login via the module-scoped client used the
+            # default peer). Login records _audit("login", ...).
+            resp = c.post("/api/auth/login", json={"username": "admin", "password": "testpass"})
+            assert resp.status_code == 200
+            cookies = resp.cookies
+            # And hit the audit-log endpoint through the same client/peer to be safe.
+            audit_resp = c.get("/api/audit-log?action=login&username=admin", cookies=cookies)
+            assert audit_resp.status_code == 200
+            entries = audit_resp.json()["entries"]
+            matching = [e for e in entries if e.get("client_ip") == "203.0.113.9"]
+            assert matching, (
+                f"expected at least one login audit row with client_ip=203.0.113.9, "
+                f"got entries={entries!r}"
+            )
+
+    def test_audit_client_ip_null_outside_request(self):
+        """_audit called outside any request context (no _client_ip_ctx set) must
+        store client_ip=NULL — this is the background-crawl / startup case."""
+        m = _main_module()
+        token = m._client_ip_ctx.set(None)  # ensure clean state
+        try:
+            m._audit("unit_test_action", "some_user", details="no-request")
+            with m._get_users_db() as db:
+                row = db.execute(
+                    "SELECT client_ip FROM audit_log "
+                    "WHERE action='unit_test_action' AND username='some_user' "
+                    "ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            assert row is not None, "audit row should have been inserted"
+            assert row["client_ip"] is None, f"expected NULL, got {row['client_ip']!r}"
+        finally:
+            m._client_ip_ctx.reset(token)
+
+    def test_audit_client_ip_from_contextvar(self):
+        """_audit reads _client_ip_ctx — setting it to a specific value (without any
+        HTTP request) is reflected verbatim in the audit row. This is the resolved-IP
+        mechanism, tested independently of the HTTP stack."""
+        m = _main_module()
+        token = m._client_ip_ctx.set("198.51.100.42")
+        try:
+            m._audit("ctx_test_action", "ctx_user")
+            with m._get_users_db() as db:
+                row = db.execute(
+                    "SELECT client_ip FROM audit_log "
+                    "WHERE action='ctx_test_action' AND username='ctx_user' "
+                    "ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            assert row is not None, "audit row should have been inserted"
+            assert row["client_ip"] == "198.51.100.42", (
+                f"expected 198.51.100.42, got {row['client_ip']!r}"
+            )
+        finally:
+            m._client_ip_ctx.reset(token)
+
+    def test_get_audit_log_includes_client_ip_field(self, client, admin_cookies):
+        """The /api/audit-log response contract must include a client_ip key on every
+        entry (None for pre-migration rows, a string otherwise)."""
+        resp = client.get("/api/audit-log", cookies=admin_cookies)
+        assert resp.status_code == 200
+        entries = resp.json()["entries"]
+        assert isinstance(entries, list)
+        # There should be at least some audit rows from earlier tests' logins.
+        assert entries, "expected at least one audit entry to be present"
+        for e in entries:
+            assert "client_ip" in e, f"entry missing client_ip key: {e!r}"
+            assert e["client_ip"] is None or isinstance(e["client_ip"], str)
+
+    def test_schema_migration_is_additive(self):
+        """_init_users_db() must be idempotent: re-running it (with the client_ip
+        column already present) must not raise, and the audit_log table must expose
+        client_ip via PRAGMA table_info."""
+        m = _main_module()
+        # Idempotent: column already exists from app import; second ALTER must be a no-op.
+        m._init_users_db()
+        with m._get_users_db() as db:
+            cols = [r["name"] for r in db.execute("PRAGMA table_info(audit_log)").fetchall()]
+        assert "client_ip" in cols, f"client_ip missing from audit_log schema; got {cols!r}"
+

@@ -215,9 +215,10 @@ async def bucket_permission_middleware(request: Request, call_next):
 
 
 # ── Multi-Endpoint URL Rewriting + S3-key session Middleware ────────────────
-# Registered LAST → OUTERMOST: runs first on the way in, so the path is rewritten and
-# the S3-key user's credentials/endpoint are bound into context BEFORE the permission
-# middleware and route handler execute.
+# Runs inside TrustedProxyMiddleware (added via add_middleware, outermost, runs
+# first) so request.client is already the resolved IP here. Runs before the
+# permission middleware and route handler, so the path is rewritten and the
+# S3-key user's credentials/endpoint are bound into context BEFORE they execute.
 
 @app.middleware("http")
 async def endpoint_routing_middleware(request: Request, call_next):
@@ -243,11 +244,15 @@ async def endpoint_routing_middleware(request: Request, call_next):
     request.state.endpoint_id = endpoint_id
     t_e = _endpoint_ctx.set(endpoint_id)
     t_u = _user_creds_ctx.set(user_creds)
+    # request.client.host is already the resolved IP here (TrustedProxyMiddleware
+    # rewrote scope["client"] on the way in); capture it so _audit can record it.
+    t_c = _client_ip_ctx.set(request.client.host if request.client else None)
     try:
         return await call_next(request)
     finally:
         _endpoint_ctx.reset(t_e)
         _user_creds_ctx.reset(t_u)
+        _client_ip_ctx.reset(t_c)
 
 
 # ── Login Rate Limiter ──────────────────────────────────────────────────────
@@ -493,6 +498,14 @@ _endpoint_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("_endpoint_c
 # sessions, API tokens, and background (crawl) threads → those keep using server creds.
 _user_creds_ctx: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("_user_creds_ctx", default=None)
 
+# Resolved client IP for the current request — set in endpoint_routing_middleware from
+# request.client.host (which TrustedProxyMiddleware has already rewritten to the real
+# client IP when TRUSTED_PROXIES is configured, and left as the direct peer otherwise).
+# _audit() reads this so every request-scoped audit row records the resolved IP without
+# needing the request threaded through ~60 call sites. None outside a request context
+# (background crawls, startup) → those audit rows store NULL.
+_client_ip_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_client_ip_ctx", default=None)
+
 # Keep thread-local as fallback for background threads that set it explicitly
 _s3_context = threading.local()
 
@@ -555,6 +568,13 @@ def _init_users_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(username)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_bucket ON audit_log(bucket)")
+    # client_ip (added for trusted-proxy client resolution; NULL for rows written
+    # before this column existed, and for audit events outside a request context).
+    for col, coldef in [("client_ip", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE audit_log ADD COLUMN {col} {coldef}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     # API tokens table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS api_tokens (
@@ -821,11 +841,12 @@ def _audit(action: str, username: str, bucket: Optional[str] = None, details: Op
     details_text = "" if details is None else str(details)
     if len(details_text) > 1000:
         details_text = details_text[:1000] + "..."
+    client_ip = _client_ip_ctx.get()  # None outside a request context → NULL
     try:
         with _get_users_db() as db:
             db.execute(
-                "INSERT INTO audit_log (timestamp, username, action, bucket, details) VALUES (?, ?, ?, ?, ?)",
-                (datetime.now(timezone.utc).isoformat(), username, action, bucket, details_text),
+                "INSERT INTO audit_log (timestamp, username, action, bucket, details, client_ip) VALUES (?, ?, ?, ?, ?, ?)",
+                (datetime.now(timezone.utc).isoformat(), username, action, bucket, details_text, client_ip),
             )
             db.commit()
         _audit_failures = 0
@@ -4109,7 +4130,7 @@ def get_audit_log(
     with _get_users_db() as db:
         total = db.execute(f"SELECT COUNT(*) FROM audit_log {where}", params).fetchone()[0]
         rows = db.execute(
-            f"SELECT id, timestamp, username, action, bucket, details FROM audit_log {where} "
+            f"SELECT id, timestamp, username, action, bucket, details, client_ip FROM audit_log {where} "
             "ORDER BY id DESC LIMIT ? OFFSET ?",
             params + [limit, offset],
         ).fetchall()
