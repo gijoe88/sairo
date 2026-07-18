@@ -1059,6 +1059,17 @@ class TestGithubAllowedDomains:
 
         monkeypatch.setattr("httpx.get", _get)
 
+    def _state_handshake(self, c):
+        """Call oauth_start to obtain the signed oauth_state cookie + the state
+        param, so the callback's new CSRF check passes. Returns (cookies_dict,
+        state_value)."""
+        from urllib.parse import urlparse, parse_qs
+        start = c.get("/api/auth/oauth/github/login", follow_redirects=False)
+        cookie = start.cookies.get("oauth_state")
+        loc = start.headers["location"]
+        state = parse_qs(urlparse(loc).query)["state"][0]
+        return {"oauth_state": cookie}, state
+
     def test_github_public_email_allowed_domain_admitted(self, app, monkeypatch):
         """A user whose public /user email is in the allow-list is admitted and
         gets a session cookie — /user/emails is not needed."""
@@ -1068,8 +1079,9 @@ class TestGithubAllowedDomains:
                        user_payload={"login": "gh-alice", "email": "alice@allowed.example"},
                        emails_payload=[])
         with TestClient(app) as c:
-            resp = c.get("/api/auth/oauth/github/callback?code=abc",
-                         follow_redirects=False)
+            ck, st = self._state_handshake(c)
+            resp = c.get(f"/api/auth/oauth/github/callback?code=abc&state={st}",
+                         cookies=ck, follow_redirects=False)
             assert resp.status_code in (302, 307)
             assert resp.headers["location"] == "/"
             assert resp.cookies.get("access_token"), "session cookie must be set"
@@ -1087,8 +1099,9 @@ class TestGithubAllowedDomains:
                            {"email": "bob@allowed.example", "primary": True, "verified": True},
                        ])
         with TestClient(app) as c:
-            resp = c.get("/api/auth/oauth/github/callback?code=abc",
-                         follow_redirects=False)
+            ck, st = self._state_handshake(c)
+            resp = c.get(f"/api/auth/oauth/github/callback?code=abc&state={st}",
+                         cookies=ck, follow_redirects=False)
             assert resp.status_code in (302, 307)
             assert resp.headers["location"] == "/"
             assert resp.cookies.get("access_token"), "session cookie must be set"
@@ -1105,8 +1118,9 @@ class TestGithubAllowedDomains:
                            {"email": "eve@evil.example", "primary": True, "verified": True},
                        ])
         with TestClient(app) as c:
-            resp = c.get("/api/auth/oauth/github/callback?code=abc",
-                         follow_redirects=False)
+            ck, st = self._state_handshake(c)
+            resp = c.get(f"/api/auth/oauth/github/callback?code=abc&state={st}",
+                         cookies=ck, follow_redirects=False)
             assert resp.status_code in (302, 307)
             assert "error=domain_not_allowed" in resp.headers["location"]
             assert not resp.cookies.get("access_token"), "must NOT issue a session cookie"
@@ -1123,8 +1137,9 @@ class TestGithubAllowedDomains:
                            {"email": "mallory@allowed.example", "primary": True, "verified": False},
                        ])
         with TestClient(app) as c:
-            resp = c.get("/api/auth/oauth/github/callback?code=abc",
-                         follow_redirects=False)
+            ck, st = self._state_handshake(c)
+            resp = c.get(f"/api/auth/oauth/github/callback?code=abc&state={st}",
+                         cookies=ck, follow_redirects=False)
             assert resp.status_code in (302, 307)
             assert "error=domain_not_allowed" in resp.headers["location"]
             assert not resp.cookies.get("access_token"), "must NOT issue a session cookie"
@@ -1143,8 +1158,9 @@ class TestGithubAllowedDomains:
                        user_payload={"login": "gh-nobody", "email": None},
                        emails_payload=[])
         with TestClient(app) as c:
-            resp = c.get("/api/auth/oauth/github/callback?code=abc",
-                         follow_redirects=False)
+            ck, st = self._state_handshake(c)
+            resp = c.get(f"/api/auth/oauth/github/callback?code=abc&state={st}",
+                         cookies=ck, follow_redirects=False)
             assert resp.status_code in (302, 307)
             assert "error=domain_not_allowed" in resp.headers["location"]
             assert not resp.cookies.get("access_token"), "must NOT issue a session cookie"
@@ -1414,3 +1430,105 @@ class TestS3TokenPrivilegeEscalation:
         data = resp.json()
         assert data["username"] == "admin"
         assert data["role"] == "viewer"
+
+
+# ── OAuth state + PKCE (Vuln 5: login CSRF) ──────────────
+
+class TestOAuthStatePkce:
+    """A5 / Vuln 5: oauth_start/oauth_callback previously sent no state, nonce,
+    or PKCE — unlike the OIDC path. A login-CSRF attacker could trick a victim
+    into landing logged in as the attacker. The fix adds a signed state cookie
+    + S256 PKCE challenge/verifier, shared with the OIDC path via the
+    _sign_state_cookie / _verify_state_cookie / _set_state_cookie helpers."""
+
+    def _enable_google(self, monkeypatch):
+        m = _main_module()
+        monkeypatch.setattr(m, "OAUTH_GOOGLE_CLIENT_ID", "g-client")
+        monkeypatch.setattr(m, "OAUTH_GOOGLE_CLIENT_SECRET", "g-secret")
+        monkeypatch.setattr(m, "OAUTH_DEFAULT_ROLE", "viewer")
+        monkeypatch.setattr(m, "OAUTH_ALLOWED_DOMAINS", [])
+        return m
+
+    def test_oauth_start_sets_state_cookie_and_pkce_params(self, app, monkeypatch):
+        """oauth_start must redirect with state + S256 PKCE params and set a
+        signed oauth_state cookie carrying purpose=oauth_state + the verifier."""
+        import jwt as _jwt
+        m = self._enable_google(monkeypatch)
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/google/login", follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            loc = resp.headers["location"]
+            assert loc.startswith("https://accounts.google.com/o/oauth2/v2/auth?")
+            assert "state=" in loc
+            assert "code_challenge=" in loc
+            assert "code_challenge_method=S256" in loc
+            cookie = resp.cookies.get("oauth_state")
+            assert cookie, "oauth_state cookie must be set"
+            claims = _jwt.decode(cookie, m.JWT_SECRET, algorithms=["HS256"])
+            assert claims["purpose"] == "oauth_state"
+            assert claims.get("cv"), "PKCE verifier must be stashed in the cookie"
+
+    def test_oauth_callback_without_state_cookie_returns_401(self, app, monkeypatch):
+        """Core V5 negative #1: a callback with no oauth_state cookie must be
+        hard-rejected with 401 (the security boundary), not a silent redirect."""
+        self._enable_google(monkeypatch)
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/google/callback?code=x&state=y",
+                         follow_redirects=False)
+            assert resp.status_code == 401
+
+    def test_oauth_callback_state_mismatch_returns_401(self, app, monkeypatch):
+        """Core V5 negative #2: an oauth_state cookie whose state doesn't match
+        the query param (compare_digest fails) must be hard-rejected with 401."""
+        m = self._enable_google(monkeypatch)
+        forged = m._sign_state_cookie(
+            {"state": "REAL", "cv": "v", "purpose": "oauth_state"})
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/google/callback?code=x&state=ATTACKER",
+                         cookies={"oauth_state": forged}, follow_redirects=False)
+            assert resp.status_code == 401
+
+    def test_oauth_callback_happy_path_with_state_and_pkce(self, app, monkeypatch):
+        """End-to-end: real oauth_start cookie + matching state → session cookie,
+        and the recorded token-exchange request MUST carry the PKCE code_verifier
+        from the state cookie (proves PKCE is sent, not just advertised)."""
+        import jwt as _jwt
+        from types import SimpleNamespace
+        m = self._enable_google(monkeypatch)
+        email = f"happy-oauth-{uuid.uuid4().hex[:8]}@example.com"
+
+        recorded = {}
+
+        def _post(url, *a, **k):
+            recorded["url"] = url
+            recorded["data"] = k.get("data")
+            return SimpleNamespace(status_code=200, json=lambda: {"access_token": "tok"})
+
+        def _get(url, *a, **k):
+            return SimpleNamespace(status_code=200,
+                                   json=lambda: {"email": email})
+
+        monkeypatch.setattr("httpx.post", _post)
+        monkeypatch.setattr("httpx.get", _get)
+
+        with TestClient(app) as c:
+            # 1) start → obtain the real signed cookie + matching state param
+            start = c.get("/api/auth/oauth/google/login", follow_redirects=False)
+            cookie = start.cookies.get("oauth_state")
+            from urllib.parse import urlparse, parse_qs
+            state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+            # decode the verifier to compare against what the callback sends
+            st = _jwt.decode(cookie, m.JWT_SECRET, algorithms=["HS256"])
+            cv_expected = st["cv"]
+
+            # 2) callback with the matching state + cookie
+            resp = c.get(f"/api/auth/oauth/google/callback?code=abc&state={state}",
+                         cookies={"oauth_state": cookie}, follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert resp.headers["location"] == "/"
+            assert resp.cookies.get("access_token"), "session cookie must be set"
+
+        # 3) the token-exchange request carried the PKCE verifier
+        assert recorded.get("url") == "https://oauth2.googleapis.com/token"
+        assert recorded["data"].get("code_verifier") == cv_expected, \
+            "token exchange must send the PKCE verifier from the state cookie"

@@ -3734,34 +3734,93 @@ def oauth_providers():
     """Public endpoint — list available SSO providers (OAuth + OIDC)."""
     return {"providers": _auth_providers()}
 
+
+# ── Shared signed state-cookie helpers ──────────────────────────────────────
+#
+# Both the OAuth (Google/GitHub) and OIDC round-trips must bind the
+# authorization request to the browser that started it: a signed state
+# cookie defeats login CSRF (an attacker can't forge the cookie because it
+# is HMAC'd with JWT_SECRET) and carries the PKCE verifier we'll need at
+# the token exchange. These helpers give both flows one implementation.
+
+def _sign_state_cookie(payload: dict, ttl_minutes: int = 10) -> str:
+    """Sign a short-lived state-cookie payload (adds exp). Returns a JWT string."""
+    body = dict(payload)
+    body["exp"] = datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)
+    return jwt.encode(body, JWT_SECRET, algorithm="HS256")
+
+
+def _verify_state_cookie(request: Request, cookie_name: str, purpose: str):
+    """Read + verify a signed state cookie. Returns the decoded payload dict if the
+    cookie exists, the signature is valid, and `purpose` matches; else None."""
+    raw = request.cookies.get(cookie_name)
+    if not raw:
+        return None
+    try:
+        payload = jwt.decode(raw, JWT_SECRET, algorithms=["HS256"])
+    except jwt.InvalidTokenError:
+        return None
+    if payload.get("purpose") != purpose:
+        return None
+    return payload
+
+
+def _set_state_cookie(response, cookie_name: str, path: str, token: str, max_age: int = 600):
+    _secure = os.environ.get("SECURE_COOKIE", "true").lower() != "false"
+    response.set_cookie(cookie_name, token, httponly=True, samesite="lax",
+                        secure=_secure, max_age=max_age, path=path)
+
+
 @app.get("/api/auth/oauth/{provider}/login")
 def oauth_start(provider: str, request: Request):
     """Redirect user to OAuth provider."""
+    import urllib.parse, hashlib, base64
     base_url = str(request.base_url).rstrip("/")
     redirect_uri = f"{base_url}/api/auth/oauth/{provider}/callback"
+    # CSRF: random state bound to this browser via a signed cookie. PKCE: S256
+    # challenge(verifier) so a stolen authorize URL can't be redeemed.
+    state = secrets.token_urlsafe(24)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     if provider == "google" and OAUTH_GOOGLE_CLIENT_ID:
-        import urllib.parse
         params = urllib.parse.urlencode({
             "client_id": OAUTH_GOOGLE_CLIENT_ID,
             "redirect_uri": redirect_uri,
             "response_type": "code",
             "scope": "openid email profile",
             "access_type": "offline",
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
         })
-        return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
+        response = RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
     elif provider == "github" and OAUTH_GITHUB_CLIENT_ID:
-        import urllib.parse
         params = urllib.parse.urlencode({
             "client_id": OAUTH_GITHUB_CLIENT_ID,
             "redirect_uri": redirect_uri,
             "scope": "user:email",
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
         })
-        return RedirectResponse(f"https://github.com/login/oauth/authorize?{params}")
-    raise HTTPException(404, f"OAuth provider '{provider}' not configured")
+        response = RedirectResponse(f"https://github.com/login/oauth/authorize?{params}")
+    else:
+        raise HTTPException(404, f"OAuth provider '{provider}' not configured")
+    state_token = _sign_state_cookie({"state": state, "cv": verifier, "purpose": "oauth_state"})
+    _set_state_cookie(response, "oauth_state", "/api/auth/oauth", state_token)
+    return response
 
 @app.get("/api/auth/oauth/{provider}/callback")
-def oauth_callback(provider: str, code: str, request: Request):
+def oauth_callback(provider: str, code: str, request: Request, state: str = ""):
     """Handle OAuth callback, exchange code for token, create/update user."""
+    # 1) CSRF: the state param must match the signed state cookie set in oauth_start.
+    st = _verify_state_cookie(request, "oauth_state", "oauth_state")
+    if not st or not code or not state:
+        raise HTTPException(401, "OAuth state validation failed")
+    if not secrets.compare_digest(st.get("state", ""), state):
+        raise HTTPException(401, "OAuth state mismatch")
+    cv = st.get("cv", "")
     import urllib.parse
     base_url = str(request.base_url).rstrip("/")
     redirect_uri = f"{base_url}/api/auth/oauth/{provider}/callback"
@@ -3775,6 +3834,7 @@ def oauth_callback(provider: str, code: str, request: Request):
             "client_secret": OAUTH_GOOGLE_CLIENT_SECRET,
             "redirect_uri": redirect_uri,
             "grant_type": "authorization_code",
+            "code_verifier": cv,
         })
         if token_resp.status_code != 200:
             return RedirectResponse(f"/?error=oauth_failed")
@@ -3799,6 +3859,7 @@ def oauth_callback(provider: str, code: str, request: Request):
             "client_secret": OAUTH_GITHUB_CLIENT_SECRET,
             "code": code,
             "redirect_uri": redirect_uri,
+            "code_verifier": cv,
         }, headers={"Accept": "application/json"})
         if token_resp.status_code != 200:
             return RedirectResponse(f"/?error=oauth_failed")
@@ -4009,14 +4070,10 @@ def oidc_start(request: Request):
     # Stash state/nonce/verifier in a short-lived signed cookie bound to this
     # browser. SameSite=Lax (not Strict) so it survives the top-level redirect
     # back from the IdP; Strict would drop it on the cross-site return.
-    state_token = jwt.encode(
-        {"state": state, "nonce": nonce, "cv": verifier, "purpose": "oidc_state",
-         "exp": datetime.now(timezone.utc) + timedelta(minutes=10)},
-        JWT_SECRET, algorithm="HS256")
+    state_token = _sign_state_cookie(
+        {"state": state, "nonce": nonce, "cv": verifier, "purpose": "oidc_state"})
     response = RedirectResponse(f"{cfg['authorization_endpoint']}?{params}")
-    _secure_cookie = os.environ.get("SECURE_COOKIE", "true").lower() != "false"
-    response.set_cookie("oidc_state", state_token, httponly=True, samesite="lax",
-                        secure=_secure_cookie, max_age=600, path="/api/auth/oidc")
+    _set_state_cookie(response, "oidc_state", "/api/auth/oidc", state_token)
     return response
 
 
@@ -4029,14 +4086,10 @@ def oidc_callback(request: Request, code: str = "", state: str = "", error: str 
         return RedirectResponse("/?error=oidc_failed")
 
     # 1) CSRF: the state param must match the signed state cookie we set.
-    state_cookie = request.cookies.get("oidc_state")
-    if not state_cookie or not code or not state:
+    st = _verify_state_cookie(request, "oidc_state", "oidc_state")
+    if not st or not code or not state:
         return RedirectResponse("/?error=oidc_failed")
-    try:
-        st = jwt.decode(state_cookie, JWT_SECRET, algorithms=["HS256"])
-    except jwt.InvalidTokenError:
-        return RedirectResponse("/?error=oidc_failed")
-    if st.get("purpose") != "oidc_state" or not secrets.compare_digest(st.get("state", ""), state):
+    if not secrets.compare_digest(st.get("state", ""), state):
         return RedirectResponse("/?error=oidc_state_mismatch")
 
     import httpx
