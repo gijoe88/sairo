@@ -6871,6 +6871,16 @@ def _require_default_bucket():
 
 def _check_compat_bucket_read(user: dict):
     """Check the user has read access to the default bucket (compat endpoints bypass middleware)."""
+    # AUTH_MODE=s3: the local index is built with server creds, so we must independently
+    # confirm the user's own IAM keys can reach the default bucket — otherwise the index
+    # would leak metadata of buckets the user cannot access. Mirrors bucket_permission_middleware.
+    creds = _user_creds_ctx.get(None)
+    if creds and creds.get("ak"):
+        endpoint_id = _endpoint_ctx.get("default")
+        if not _s3_user_can_access(creds, endpoint_id, _DEFAULT_BUCKET):
+            raise HTTPException(403, f"No access to bucket '{_DEFAULT_BUCKET}'")
+        return
+    # Password mode: admin bypass, else explicit bucket_permissions grant.
     if user["role"] == "admin":
         return
     with _get_users_db() as db:
@@ -6893,6 +6903,7 @@ def search_compat(q: str = Query(..., min_length=1), prefix: str = "", limit: in
 def crawl_status_compat(user: dict = Depends(get_current_user)):
     if not _DEFAULT_BUCKET:
         return {"status": "no_bucket"}
+    _check_compat_bucket_read(user)
     return crawl_status(_DEFAULT_BUCKET)
 
 @app.post("/api/crawl")

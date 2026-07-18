@@ -1252,3 +1252,82 @@ class TestShareLinkAccessControl:
             "admin must see rows from multiple owners"
         assert all("token" not in link for link in admin_links), \
             "token column must not be exposed"
+
+
+# ── S3 Index Metadata Leak (V9) ──────────────────────────
+
+class TestS3IndexMetadataLeak:
+    """A4 / Vuln 9: in AUTH_MODE=s3 every session JWT has role=admin, so the old
+    admin short-circuit in _check_compat_bucket_read let any s3 user read the LOCAL
+    index (built with server creds) — leaking metadata of buckets their IAM denies.
+    The fix gates the compat read routes by the user's own IAM."""
+
+    def _enable_s3(self, monkeypatch, allow=False):
+        """Flip AUTH_MODE=s3, point _DEFAULT_BUCKET at a known name, and stub the
+        IAM access probe so we can deterministically allow/deny the user."""
+        try:
+            import backend.main as m
+        except ModuleNotFoundError:
+            import main as m
+        monkeypatch.setattr(m, "AUTH_MODE", "s3")
+        monkeypatch.setattr(m, "_DEFAULT_BUCKET", "default-bucket-leak-test")
+        monkeypatch.setattr(m, "_s3_user_can_access", lambda creds, eid, bucket: allow)
+        return m
+
+    def _s3_cookie(self, m):
+        """Forge a valid s3-mode session cookie so endpoint_routing_middleware binds
+        the user's creds into _user_creds_ctx for the duration of the request."""
+        import jwt
+        from datetime import datetime, timezone, timedelta
+        token = jwt.encode(
+            {"sub": "s3:testakid", "role": "admin", "eid": "default",
+             "s3ak": m._encrypt("AKIAFAKEACCESSKEY123"),
+             "s3sk": m._encrypt("fakeSecretKey456"),
+             "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
+            m.JWT_SECRET, algorithm="HS256")
+        return {"access_token": token}
+
+    def test_s3_user_denied_default_bucket_returns_403(self, app, monkeypatch):
+        """Negative (core V9): an s3-mode user whose IAM cannot reach the default
+        bucket must be 403'd on ALL five compat index read routes — proving the
+        index is no longer leaked through any of them."""
+        m = self._enable_s3(monkeypatch, allow=False)
+        cookie = self._s3_cookie(m)
+        paths = [
+            "/api/list",
+            "/api/search?q=x",
+            "/api/folder-size",
+            "/api/storage-breakdown",
+            "/api/crawl-status",
+        ]
+        with TestClient(app) as c:
+            for path in paths:
+                resp = c.get(path, cookies=cookie)
+                assert resp.status_code == 403, \
+                    f"{path} should be denied (IAM denies default bucket), got {resp.status_code}"
+
+    def test_password_mode_admin_still_passes_compat_check(self, client, admin_cookies, monkeypatch):
+        """Positive regression: in PASSWORD mode (AUTH_MODE=local, default), an admin must
+        still pass _check_compat_bucket_read via the admin bypass — i.e. the V9 rewrite
+        must not have broken the non-s3 path. We force _DEFAULT_BUCKET non-empty and stub
+        crawl_status so the handler actually reaches _check_compat_bucket_read instead of
+        short-circuiting at the no_bucket guard."""
+        try:
+            import backend.main as m
+        except ModuleNotFoundError:
+            import main as m
+        monkeypatch.setattr(m, "_DEFAULT_BUCKET", "any-bucket-for-regression")
+        monkeypatch.setattr(m, "crawl_status", lambda bucket: {"status": "ok"})
+        resp = client.get("/api/crawl-status", cookies=admin_cookies)
+        assert resp.status_code != 403, "password-mode admin must not be 403'd by the rewrite"
+
+    def test_s3_user_allowed_default_bucket_not_blocked(self, app, monkeypatch):
+        """Positive: when the s3 user's IAM ALLOWS the default bucket, _check_compat_bucket_read
+        returns cleanly (no 403) and the route proceeds. Proves the gate doesn't false-positive
+        and that the successful-s3 'return' doesn't fall through to the password-mode branch."""
+        m = self._enable_s3(monkeypatch, allow=True)   # _s3_user_can_access -> True
+        monkeypatch.setattr(m, "crawl_status", lambda bucket: {"status": "ok"})
+        with TestClient(app) as c:
+            resp = c.get("/api/crawl-status", cookies=self._s3_cookie(m))
+        assert resp.status_code == 200, f"s3 user with IAM-allow should proceed, got {resp.status_code}"
+        assert resp.json()["status"] == "ok"
