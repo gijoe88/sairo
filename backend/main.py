@@ -113,8 +113,10 @@ async def security_headers_middleware(request: Request, call_next):
 
 def _extract_s3_session(request: Request):
     """For AUTH_MODE=s3 cookie sessions, decode the JWT and return the user's
-    {ak, sk, eid} (decrypted). Returns None otherwise (password mode, API tokens,
-    no/invalid cookie). API-token (Bearer) sessions intentionally keep server creds."""
+    {ak, sk, eid} (decrypted). Returns None otherwise (password mode, or no/invalid
+    cookie). In S3 mode, Bearer (API-token) auth is refused entirely in
+    get_current_user, so every authenticated request is bound to the logged-in
+    user's own IAM keys via this cookie path."""
     if AUTH_MODE != "s3":
         return None
     token = request.cookies.get("access_token")
@@ -575,10 +577,16 @@ def _init_users_db():
             expires_at TEXT NOT NULL,
             download_count INTEGER DEFAULT 0,
             max_downloads INTEGER,
-            password_hash TEXT
+            password_hash TEXT,
+            endpoint_id TEXT NOT NULL DEFAULT 'default'
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_share_token ON share_links(token)")
+    # endpoint_id (additive migration for existing DBs)
+    try:
+        conn.execute("ALTER TABLE share_links ADD COLUMN endpoint_id TEXT NOT NULL DEFAULT 'default'")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     # License keys table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS license_info (
@@ -693,13 +701,47 @@ _init_users_db()
 
 # ── Auth Helpers ─────────────────────────────────────────────────────────────
 
+def _caller_can_read_bucket(user: dict, bucket: str, request: Request) -> bool:
+    """True if `user` is authorized to read `bucket`.
+
+    Single chokepoint for share-link authorization (and reusable elsewhere).
+    Mirrors the bucket-permission middleware's logic but in a form callable from
+    route handlers that need to authorize against a bucket mentioned in the
+    request body (which the path-based middleware cannot see).
+
+    * admins always pass;
+    * in AUTH_MODE=s3 the provider's IAM is the source of truth (cached
+      head_bucket via the request-bound user creds);
+    * in AUTH_MODE=local a row in bucket_permissions is required.
+    """
+    if user.get("role") == "admin":
+        return True
+    elif AUTH_MODE == "s3":
+        creds = _user_creds_ctx.get(None)
+        endpoint_id = _endpoint_ctx.get("default")
+        if not creds or not creds.get("ak"):
+            return False
+        return _s3_user_can_access(creds, endpoint_id, bucket)
+    else:
+        with _get_users_db() as db:
+            row = db.execute(
+                "SELECT permission FROM bucket_permissions WHERE username=? AND bucket=?",
+                (user.get("username"), bucket)
+            ).fetchone()
+        return row is not None
+
+
 def _verify_api_token(token_str: str):
     """Verify a Bearer API token. Returns {username, role} or None."""
     import hashlib
     token_hash = hashlib.sha256(token_str.encode()).hexdigest()
     with _get_users_db() as db:
+        # JOIN on users so a token is rejected once its owner row is gone
+        # (defense-in-depth for deleted users).
         row = db.execute(
-            "SELECT username, role, expires_at FROM api_tokens WHERE token_hash=?",
+            "SELECT t.username, t.role, t.expires_at FROM api_tokens t "
+            "INNER JOIN users u ON u.username = t.username "
+            "WHERE t.token_hash=?",
             (token_hash,)).fetchone()
         if not row:
             return None
@@ -720,6 +762,8 @@ def get_current_user(request: Request):
     # Check Bearer token first
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
+        if AUTH_MODE == "s3":
+            raise HTTPException(401, "API token auth is disabled in S3 mode; use the session cookie")
         token_str = auth_header[7:]
         user = _verify_api_token(token_str)
         if user:
@@ -2991,12 +3035,20 @@ def auth_me(user: dict = Depends(get_current_user), request: Request = None):
 
 @app.post("/api/auth/refresh")
 def auth_refresh(user: dict = Depends(get_current_user)):
+    # Re-check the users table so a demoted or deleted user cannot keep
+    # using their old JWT role. The DB role wins over the JWT's role.
+    with _get_users_db() as db:
+        row = db.execute("SELECT role FROM users WHERE username=?",
+                         (user["username"],)).fetchone()
+    if not row:
+        raise HTTPException(401, "User no longer exists")
+    role = row["role"]
     token = jwt.encode(
-        {"sub": user["username"], "role": user["role"],
+        {"sub": user["username"], "role": role,
          "exp": datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS)},
         JWT_SECRET, algorithm="HS256")
     _secure_cookie = os.environ.get("SECURE_COOKIE", "true").lower() != "false"
-    response = JSONResponse({"username": user["username"], "role": user["role"],
+    response = JSONResponse({"username": user["username"], "role": role,
                              "expires_in": SESSION_HOURS * 3600})
     response.set_cookie("access_token", token, httponly=True, samesite="strict",
                         secure=_secure_cookie, max_age=SESSION_HOURS * 3600, path="/")
@@ -3044,6 +3096,7 @@ def auth_delete_user(username: str, user: dict = Depends(require_admin)):
             raise HTTPException(404, f"User '{username}' not found")
         db.execute("DELETE FROM users WHERE username=?", (username,))
         db.execute("DELETE FROM bucket_permissions WHERE username=?", (username,))
+        db.execute("DELETE FROM api_tokens WHERE username=?", (username,))
         db.commit()
     _audit("delete_user", user["username"], details=f"user={username}")
     return {"deleted": username}
@@ -3059,6 +3112,7 @@ def auth_update_user(username: str, req: UpdateUserRequest, user: dict = Depends
         if not existing:
             raise HTTPException(404, f"User '{username}' not found")
         db.execute("UPDATE users SET role=? WHERE username=?", (req.role, username))
+        db.execute("UPDATE api_tokens SET role=? WHERE username=?", (req.role, username))
         db.commit()
     _audit("update_user", user["username"], details=f"user={username}, role={req.role}")
     return {"updated": username, "role": req.role}
@@ -3316,6 +3370,8 @@ def list_tokens(user: dict = Depends(require_admin)):
 @app.post("/api/auth/tokens")
 def create_token(req: CreateTokenRequest, user: dict = Depends(require_admin)):
     import hashlib
+    if user["username"].startswith("s3:"):
+        raise HTTPException(403, "S3-mode sessions cannot mint API tokens")
     if req.role not in ("admin", "viewer"):
         raise HTTPException(400, "Role must be 'admin' or 'viewer'")
     raw_token = f"sairo_{secrets.token_urlsafe(32)}"
@@ -3354,29 +3410,49 @@ class CreateShareLinkRequest(BaseModel):
     password: Optional[str] = None
 
 @app.post("/api/share-links")
-def create_share_link(req: CreateShareLinkRequest, user: dict = Depends(get_current_user)):
+def create_share_link(req: CreateShareLinkRequest, request: Request, user: dict = Depends(get_current_user)):
+    # Authorization: caller must already be able to read the bucket they're
+    # minting a presigned share link for. Without this, any viewer could mint
+    # a share link for ANY bucket/key (V1).
+    if not _caller_can_read_bucket(user, req.bucket, request):
+        raise HTTPException(403, "No access to this bucket")
     token = secrets.token_urlsafe(24)
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=req.expires_hours)).isoformat()
     password_hash = bcrypt.hash(req.password) if req.password else None
     with _get_users_db() as db:
         db.execute(
-            "INSERT INTO share_links (token, bucket, key, created_by, expires_at, max_downloads, password_hash) VALUES (?,?,?,?,?,?,?)",
-            (token, req.bucket, req.key, user["username"], expires_at, req.max_downloads, password_hash))
+            "INSERT INTO share_links (token, bucket, key, created_by, expires_at, max_downloads, password_hash, endpoint_id) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (token, req.bucket, req.key, user["username"], expires_at, req.max_downloads, password_hash, _endpoint_ctx.get("default")))
         db.commit()
     _audit("create_share_link", user["username"], bucket=req.bucket, details=f"key={req.key}")
     return {"token": token, "url": f"/share/{token}", "expires_at": expires_at}
 
 @app.get("/api/share-links")
 def list_share_links(bucket: str = "", user: dict = Depends(get_current_user)):
+    # Never expose the secret token column to list callers — only the resolver
+    # (/api/share/{token}) should accept it (V2). Non-admins see only their own
+    # rows; admins see all rows, optionally filtered by bucket.
+    cols = "id, bucket, key, created_by, created_at, expires_at, download_count, max_downloads"
     with _get_users_db() as db:
-        if bucket:
-            rows = db.execute(
-                "SELECT id, token, bucket, key, created_by, created_at, expires_at, download_count, max_downloads FROM share_links WHERE bucket=? ORDER BY created_at DESC",
-                (bucket,)).fetchall()
+        if user["role"] != "admin":
+            if bucket:
+                rows = db.execute(
+                    f"SELECT {cols} FROM share_links WHERE bucket=? AND created_by=? ORDER BY created_at DESC",
+                    (bucket, user["username"])).fetchall()
+            else:
+                rows = db.execute(
+                    f"SELECT {cols} FROM share_links WHERE created_by=? ORDER BY created_at DESC",
+                    (user["username"],)).fetchall()
         else:
-            rows = db.execute(
-                "SELECT id, token, bucket, key, created_by, created_at, expires_at, download_count, max_downloads FROM share_links ORDER BY created_at DESC"
-            ).fetchall()
+            if bucket:
+                rows = db.execute(
+                    f"SELECT {cols} FROM share_links WHERE bucket=? ORDER BY created_at DESC",
+                    (bucket,)).fetchall()
+            else:
+                rows = db.execute(
+                    f"SELECT {cols} FROM share_links ORDER BY created_at DESC"
+                ).fetchall()
     return {"links": [dict(r) for r in rows]}
 
 @app.delete("/api/share-links/{link_id}")
@@ -3414,11 +3490,19 @@ def resolve_share_link(token: str, password: str = ""):
     if row["password_hash"]:
         if not password or not bcrypt.verify(password, row["password_hash"]):
             raise HTTPException(401, "Password required")
-    # Generate presigned URL
-    url = s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": row["bucket"], "Key": row["key"]},
-        ExpiresIn=3600)
+    # Generate presigned URL against the endpoint the link was created for.
+    # The resolver is public (no auth) so _endpoint_ctx is "default" here —
+    # without this switch, share links minted on a non-default endpoint would
+    # resolve against the wrong S3 and 400/404.
+    eid = row.get("endpoint_id") or "default"
+    t_e = _endpoint_ctx.set(eid)
+    try:
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": row["bucket"], "Key": row["key"]},
+            ExpiresIn=3600)
+    finally:
+        _endpoint_ctx.reset(t_e)
     # Update download count
     with _get_users_db() as db:
         db.execute("UPDATE share_links SET download_count = download_count + 1 WHERE token=?", (token,))
@@ -3650,34 +3734,93 @@ def oauth_providers():
     """Public endpoint — list available SSO providers (OAuth + OIDC)."""
     return {"providers": _auth_providers()}
 
+
+# ── Shared signed state-cookie helpers ──────────────────────────────────────
+#
+# Both the OAuth (Google/GitHub) and OIDC round-trips must bind the
+# authorization request to the browser that started it: a signed state
+# cookie defeats login CSRF (an attacker can't forge the cookie because it
+# is HMAC'd with JWT_SECRET) and carries the PKCE verifier we'll need at
+# the token exchange. These helpers give both flows one implementation.
+
+def _sign_state_cookie(payload: dict, ttl_minutes: int = 10) -> str:
+    """Sign a short-lived state-cookie payload (adds exp). Returns a JWT string."""
+    body = dict(payload)
+    body["exp"] = datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)
+    return jwt.encode(body, JWT_SECRET, algorithm="HS256")
+
+
+def _verify_state_cookie(request: Request, cookie_name: str, purpose: str):
+    """Read + verify a signed state cookie. Returns the decoded payload dict if the
+    cookie exists, the signature is valid, and `purpose` matches; else None."""
+    raw = request.cookies.get(cookie_name)
+    if not raw:
+        return None
+    try:
+        payload = jwt.decode(raw, JWT_SECRET, algorithms=["HS256"])
+    except jwt.InvalidTokenError:
+        return None
+    if payload.get("purpose") != purpose:
+        return None
+    return payload
+
+
+def _set_state_cookie(response, cookie_name: str, path: str, token: str, max_age: int = 600):
+    _secure = os.environ.get("SECURE_COOKIE", "true").lower() != "false"
+    response.set_cookie(cookie_name, token, httponly=True, samesite="lax",
+                        secure=_secure, max_age=max_age, path=path)
+
+
 @app.get("/api/auth/oauth/{provider}/login")
 def oauth_start(provider: str, request: Request):
     """Redirect user to OAuth provider."""
+    import urllib.parse, hashlib, base64
     base_url = str(request.base_url).rstrip("/")
     redirect_uri = f"{base_url}/api/auth/oauth/{provider}/callback"
+    # CSRF: random state bound to this browser via a signed cookie. PKCE: S256
+    # challenge(verifier) so a stolen authorize URL can't be redeemed.
+    state = secrets.token_urlsafe(24)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     if provider == "google" and OAUTH_GOOGLE_CLIENT_ID:
-        import urllib.parse
         params = urllib.parse.urlencode({
             "client_id": OAUTH_GOOGLE_CLIENT_ID,
             "redirect_uri": redirect_uri,
             "response_type": "code",
             "scope": "openid email profile",
             "access_type": "offline",
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
         })
-        return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
+        response = RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
     elif provider == "github" and OAUTH_GITHUB_CLIENT_ID:
-        import urllib.parse
         params = urllib.parse.urlencode({
             "client_id": OAUTH_GITHUB_CLIENT_ID,
             "redirect_uri": redirect_uri,
             "scope": "user:email",
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
         })
-        return RedirectResponse(f"https://github.com/login/oauth/authorize?{params}")
-    raise HTTPException(404, f"OAuth provider '{provider}' not configured")
+        response = RedirectResponse(f"https://github.com/login/oauth/authorize?{params}")
+    else:
+        raise HTTPException(404, f"OAuth provider '{provider}' not configured")
+    state_token = _sign_state_cookie({"state": state, "cv": verifier, "purpose": "oauth_state"})
+    _set_state_cookie(response, "oauth_state", "/api/auth/oauth", state_token)
+    return response
 
 @app.get("/api/auth/oauth/{provider}/callback")
-def oauth_callback(provider: str, code: str, request: Request):
+def oauth_callback(provider: str, code: str, request: Request, state: str = ""):
     """Handle OAuth callback, exchange code for token, create/update user."""
+    # 1) CSRF: the state param must match the signed state cookie set in oauth_start.
+    st = _verify_state_cookie(request, "oauth_state", "oauth_state")
+    if not st or not code or not state:
+        raise HTTPException(401, "OAuth state validation failed")
+    if not secrets.compare_digest(st.get("state", ""), state):
+        raise HTTPException(401, "OAuth state mismatch")
+    cv = st.get("cv", "")
     import urllib.parse
     base_url = str(request.base_url).rstrip("/")
     redirect_uri = f"{base_url}/api/auth/oauth/{provider}/callback"
@@ -3691,6 +3834,7 @@ def oauth_callback(provider: str, code: str, request: Request):
             "client_secret": OAUTH_GOOGLE_CLIENT_SECRET,
             "redirect_uri": redirect_uri,
             "grant_type": "authorization_code",
+            "code_verifier": cv,
         })
         if token_resp.status_code != 200:
             return RedirectResponse(f"/?error=oauth_failed")
@@ -3715,6 +3859,7 @@ def oauth_callback(provider: str, code: str, request: Request):
             "client_secret": OAUTH_GITHUB_CLIENT_SECRET,
             "code": code,
             "redirect_uri": redirect_uri,
+            "code_verifier": cv,
         }, headers={"Accept": "application/json"})
         if token_resp.status_code != 200:
             return RedirectResponse(f"/?error=oauth_failed")
@@ -3730,9 +3875,23 @@ def oauth_callback(provider: str, code: str, request: Request):
         gh_user = user_resp.json()
         username = gh_user.get("login", "unknown")
         email = gh_user.get("email") or ""
+        # GitHub's /user returns email=null when the address is private; the
+        # user:email scope is already requested, so fall back to /user/emails.
+        if not email:
+            try:
+                emails_resp = httpx.get("https://api.github.com/user/emails",
+                                        headers={"Authorization": f"Bearer {access_token}",
+                                                 "Accept": "application/json"})
+                if emails_resp.status_code == 200:
+                    for entry in emails_resp.json() or []:
+                        if entry.get("primary") and entry.get("verified"):
+                            email = entry.get("email") or ""
+                            break
+            except Exception:
+                pass
         domain = email.split("@")[1] if "@" in email else ""
 
-        if OAUTH_ALLOWED_DOMAINS and domain and domain not in OAUTH_ALLOWED_DOMAINS:
+        if OAUTH_ALLOWED_DOMAINS and domain not in OAUTH_ALLOWED_DOMAINS:
             return RedirectResponse(f"/?error=domain_not_allowed")
     else:
         return RedirectResponse(f"/?error=unknown_provider")
@@ -3911,14 +4070,10 @@ def oidc_start(request: Request):
     # Stash state/nonce/verifier in a short-lived signed cookie bound to this
     # browser. SameSite=Lax (not Strict) so it survives the top-level redirect
     # back from the IdP; Strict would drop it on the cross-site return.
-    state_token = jwt.encode(
-        {"state": state, "nonce": nonce, "cv": verifier, "purpose": "oidc_state",
-         "exp": datetime.now(timezone.utc) + timedelta(minutes=10)},
-        JWT_SECRET, algorithm="HS256")
+    state_token = _sign_state_cookie(
+        {"state": state, "nonce": nonce, "cv": verifier, "purpose": "oidc_state"})
     response = RedirectResponse(f"{cfg['authorization_endpoint']}?{params}")
-    _secure_cookie = os.environ.get("SECURE_COOKIE", "true").lower() != "false"
-    response.set_cookie("oidc_state", state_token, httponly=True, samesite="lax",
-                        secure=_secure_cookie, max_age=600, path="/api/auth/oidc")
+    _set_state_cookie(response, "oidc_state", "/api/auth/oidc", state_token)
     return response
 
 
@@ -3931,14 +4086,10 @@ def oidc_callback(request: Request, code: str = "", state: str = "", error: str 
         return RedirectResponse("/?error=oidc_failed")
 
     # 1) CSRF: the state param must match the signed state cookie we set.
-    state_cookie = request.cookies.get("oidc_state")
-    if not state_cookie or not code or not state:
+    st = _verify_state_cookie(request, "oidc_state", "oidc_state")
+    if not st or not code or not state:
         return RedirectResponse("/?error=oidc_failed")
-    try:
-        st = jwt.decode(state_cookie, JWT_SECRET, algorithms=["HS256"])
-    except jwt.InvalidTokenError:
-        return RedirectResponse("/?error=oidc_failed")
-    if st.get("purpose") != "oidc_state" or not secrets.compare_digest(st.get("state", ""), state):
+    if not secrets.compare_digest(st.get("state", ""), state):
         return RedirectResponse("/?error=oidc_state_mismatch")
 
     import httpx
@@ -6779,6 +6930,16 @@ def _require_default_bucket():
 
 def _check_compat_bucket_read(user: dict):
     """Check the user has read access to the default bucket (compat endpoints bypass middleware)."""
+    # AUTH_MODE=s3: the local index is built with server creds, so we must independently
+    # confirm the user's own IAM keys can reach the default bucket — otherwise the index
+    # would leak metadata of buckets the user cannot access. Mirrors bucket_permission_middleware.
+    creds = _user_creds_ctx.get(None)
+    if creds and creds.get("ak"):
+        endpoint_id = _endpoint_ctx.get("default")
+        if not _s3_user_can_access(creds, endpoint_id, _DEFAULT_BUCKET):
+            raise HTTPException(403, f"No access to bucket '{_DEFAULT_BUCKET}'")
+        return
+    # Password mode: admin bypass, else explicit bucket_permissions grant.
     if user["role"] == "admin":
         return
     with _get_users_db() as db:
@@ -6801,6 +6962,7 @@ def search_compat(q: str = Query(..., min_length=1), prefix: str = "", limit: in
 def crawl_status_compat(user: dict = Depends(get_current_user)):
     if not _DEFAULT_BUCKET:
         return {"status": "no_bucket"}
+    _check_compat_bucket_read(user)
     return crawl_status(_DEFAULT_BUCKET)
 
 @app.post("/api/crawl")

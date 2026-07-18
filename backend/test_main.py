@@ -13,6 +13,7 @@ import json
 import base64
 import hashlib
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
@@ -857,3 +858,677 @@ class TestCompatPermissions:
                          "/api/presigned-url?key=test", "/api/multipart-uploads"]:
                 resp = fresh.get(path)
                 assert resp.status_code == 401, f"{path} should require auth, got {resp.status_code}"
+
+
+# ── Session & Token Revocation (V3/V8) ───────────────────
+
+class TestSessionAndTokenRevocation:
+    """A demoted or deleted admin must not be able to keep using their
+    existing session JWT or API token. Refresh and token-verify must
+    re-check the users table."""
+
+    def test_demoted_admin_refresh_returns_lower_role(self, client, admin_cookies):
+        """A demoted user's refresh should mint a JWT carrying the new (DB) role."""
+        uname = f"adm-demote-{uuid.uuid4().hex[:8]}"
+        pw = "testpass-demote-1234"
+
+        # Default admin creates a second admin
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": uname, "password": pw, "role": "admin"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+
+        # Second admin logs in to get their own cookie
+        resp = client.post("/api/auth/login", json={"username": uname, "password": pw})
+        assert resp.status_code == 200, resp.text
+        demoted_cookies = resp.cookies
+
+        # Default admin demotes them to viewer
+        resp = client.put(
+            f"/api/auth/users/{uname}",
+            json={"role": "viewer"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+
+        # Demoted user refreshes; the new JWT/cookie should reflect viewer
+        resp = client.post("/api/auth/refresh", cookies=demoted_cookies)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["role"] == "viewer"
+
+    def test_deleted_user_refresh_returns_401(self, client, admin_cookies):
+        """A deleted user's session cookie must stop working on refresh."""
+        uname = f"u-del-refresh-{uuid.uuid4().hex[:8]}"
+        pw = "testpass-delrefresh-1"
+
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": uname, "password": pw, "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+
+        resp = client.post("/api/auth/login", json={"username": uname, "password": pw})
+        assert resp.status_code == 200, resp.text
+        deleted_cookies = resp.cookies
+
+        # Default admin deletes the user
+        resp = client.delete(f"/api/auth/users/{uname}", cookies=admin_cookies)
+        assert resp.status_code == 200, resp.text
+
+        # Their cookie should no longer refresh
+        resp = client.post("/api/auth/refresh", cookies=deleted_cookies)
+        assert resp.status_code == 401, resp.text
+
+    def test_deleted_user_api_token_returns_401(self, client, admin_cookies):
+        """A deleted user's API token must immediately stop authenticating."""
+        uname = f"adm-del-token-{uuid.uuid4().hex[:8]}"
+        pw = "testpass-deltoken-12"
+
+        # Create a second admin (token creation requires admin)
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": uname, "password": pw, "role": "admin"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+
+        resp = client.post("/api/auth/login", json={"username": uname, "password": pw})
+        assert resp.status_code == 200, resp.text
+        second_admin_cookies = resp.cookies
+
+        # Second admin creates an API token
+        resp = client.post(
+            "/api/auth/tokens",
+            json={"name": "revoke-on-delete", "role": "admin"},
+            cookies=second_admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+        raw_token = resp.json()["token"]
+
+        # Token works before deletion
+        resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 200, resp.text
+
+        # Default admin deletes the user
+        resp = client.delete(f"/api/auth/users/{uname}", cookies=admin_cookies)
+        assert resp.status_code == 200, resp.text
+
+        # Token must no longer authenticate
+        resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 401, resp.text
+
+    def test_orphaned_api_token_rejected_after_owner_deleted(self, client, admin_cookies):
+        """Defense-in-depth: an api_tokens row whose owner users row is gone
+        (orphaned by a non-cascade delete) must be rejected by the INNER JOIN
+        in _verify_api_token — even though the token row itself still exists.
+
+        test_deleted_user_api_token_returns_401 above does NOT isolate this path:
+        auth_delete_user also runs `DELETE FROM api_tokens WHERE username=?`, so the
+        token row is gone and the JOIN is never the deciding factor. Here we leave the
+        api_tokens row in place by deleting only the users row directly.
+        """
+        try:
+            from backend.main import _get_users_db
+        except ModuleNotFoundError:
+            from main import _get_users_db
+
+        uname = f"u-orphan-{uuid.uuid4().hex[:8]}"
+        pw = "testpass-orphan-123"
+
+        # Admin creates a throwaway admin user (token creation requires admin)
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": uname, "password": pw, "role": "admin"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+
+        # That user logs in and creates an API token
+        resp = client.post("/api/auth/login", json={"username": uname, "password": pw})
+        assert resp.status_code == 200, resp.text
+        second_admin_cookies = resp.cookies
+
+        resp = client.post(
+            "/api/auth/tokens",
+            json={"name": "orphan-guard", "role": "admin"},
+            cookies=second_admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+        raw_token = resp.json()["token"]
+
+        # Positive regression guard: token works while owner exists
+        resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 200, resp.text
+
+        # Delete ONLY the users row, leaving the api_tokens row orphaned.
+        # We bypass the delete endpoint so the api_tokens cascade does NOT run.
+        with _get_users_db() as db:
+            db.execute("DELETE FROM users WHERE username=?", (uname,))
+            db.commit()
+
+        # Confirm the api_tokens row is still there (orphaned) — this is what
+        # makes the INNER JOIN, not the token-row delete, the deciding factor.
+        with _get_users_db() as db:
+            row = db.execute(
+                "SELECT username FROM api_tokens WHERE username=?", (uname,)).fetchone()
+        assert row is not None, "orphaned api_tokens row should still exist"
+
+        # Negative case: the token row exists but its owner is gone, so the
+        # INNER JOIN users in _verify_api_token must reject it with 401.
+        resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 401, resp.text
+
+
+# ── GitHub allowed-domains (Vuln 7: fail-closed regression) ──────────────
+
+class TestGithubAllowedDomains:
+    """GitHub branch of oauth_callback must fail closed when the user has no
+    public email: fetch /user/emails (already-requested user:email scope) and
+    pick the primary+verified entry, then enforce OAUTH_ALLOWED_DOMAINS against
+    it. Previously the `and domain` guard short-circuited on empty email and
+    admitted anyone whenever the allow-list was set."""
+
+    def _enable(self, monkeypatch):
+        m = _main_module()
+        monkeypatch.setattr(m, "OAUTH_GITHUB_CLIENT_ID", "gh-client-id")
+        monkeypatch.setattr(m, "OAUTH_GITHUB_CLIENT_SECRET", "gh-secret")
+        monkeypatch.setattr(m, "OAUTH_DEFAULT_ROLE", "viewer")
+        monkeypatch.setattr(m, "OAUTH_ALLOWED_DOMAINS", ["allowed.example"])
+        return m
+
+    def _stub_token(self, monkeypatch):
+        from types import SimpleNamespace
+        monkeypatch.setattr(
+            "httpx.post",
+            lambda *a, **k: SimpleNamespace(status_code=200,
+                                            json=lambda: {"access_token": "gh-tok"}))
+
+    def _stub_get(self, monkeypatch, user_payload, emails_payload):
+        """Route /user vs /user/emails by URL; return SimpleNamespace fakes."""
+        from types import SimpleNamespace
+
+        def _get(url, *a, **k):
+            if url == "https://api.github.com/user":
+                return SimpleNamespace(status_code=200, json=lambda: user_payload)
+            if url == "https://api.github.com/user/emails":
+                return SimpleNamespace(status_code=200, json=lambda: emails_payload)
+            return SimpleNamespace(status_code=404, json=lambda: {})
+
+        monkeypatch.setattr("httpx.get", _get)
+
+    def _state_handshake(self, c):
+        """Call oauth_start to obtain the signed oauth_state cookie + the state
+        param, so the callback's new CSRF check passes. Returns (cookies_dict,
+        state_value)."""
+        from urllib.parse import urlparse, parse_qs
+        start = c.get("/api/auth/oauth/github/login", follow_redirects=False)
+        cookie = start.cookies.get("oauth_state")
+        loc = start.headers["location"]
+        state = parse_qs(urlparse(loc).query)["state"][0]
+        return {"oauth_state": cookie}, state
+
+    def test_github_public_email_allowed_domain_admitted(self, app, monkeypatch):
+        """A user whose public /user email is in the allow-list is admitted and
+        gets a session cookie — /user/emails is not needed."""
+        m = self._enable(monkeypatch)
+        self._stub_token(monkeypatch)
+        self._stub_get(monkeypatch,
+                       user_payload={"login": "gh-alice", "email": "alice@allowed.example"},
+                       emails_payload=[])
+        with TestClient(app) as c:
+            ck, st = self._state_handshake(c)
+            resp = c.get(f"/api/auth/oauth/github/callback?code=abc&state={st}",
+                         cookies=ck, follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert resp.headers["location"] == "/"
+            assert resp.cookies.get("access_token"), "session cookie must be set"
+
+    def test_github_no_public_email_fetched_from_emails_allowed(self, app, monkeypatch):
+        """When /user has email=null, the primary+verified address from
+        /user/emails is used and admission proceeds when it matches the
+        allow-list."""
+        m = self._enable(monkeypatch)
+        self._stub_token(monkeypatch)
+        self._stub_get(monkeypatch,
+                       user_payload={"login": "gh-bob", "email": None},
+                       emails_payload=[
+                           {"email": "bob@other.example", "primary": False, "verified": True},
+                           {"email": "bob@allowed.example", "primary": True, "verified": True},
+                       ])
+        with TestClient(app) as c:
+            ck, st = self._state_handshake(c)
+            resp = c.get(f"/api/auth/oauth/github/callback?code=abc&state={st}",
+                         cookies=ck, follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert resp.headers["location"] == "/"
+            assert resp.cookies.get("access_token"), "session cookie must be set"
+
+    def test_github_no_public_email_fail_closed_rejected(self, app, monkeypatch):
+        """REGRESSION for V7: with no public email and a /user/emails address
+        outside the allow-list, the user must be rejected. Previously the
+        `and domain` guard short-circuited on empty email and admitted anyone."""
+        m = self._enable(monkeypatch)
+        self._stub_token(monkeypatch)
+        self._stub_get(monkeypatch,
+                       user_payload={"login": "gh-eve", "email": None},
+                       emails_payload=[
+                           {"email": "eve@evil.example", "primary": True, "verified": True},
+                       ])
+        with TestClient(app) as c:
+            ck, st = self._state_handshake(c)
+            resp = c.get(f"/api/auth/oauth/github/callback?code=abc&state={st}",
+                         cookies=ck, follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert "error=domain_not_allowed" in resp.headers["location"]
+            assert not resp.cookies.get("access_token"), "must NOT issue a session cookie"
+
+    def test_github_emails_all_unverified_rejected(self, app, monkeypatch):
+        """An allowed-domain address that is primary but NOT verified must not
+        satisfy the check — only primary+verified entries are trusted, so the
+        user is rejected here."""
+        m = self._enable(monkeypatch)
+        self._stub_token(monkeypatch)
+        self._stub_get(monkeypatch,
+                       user_payload={"login": "gh-mallory", "email": None},
+                       emails_payload=[
+                           {"email": "mallory@allowed.example", "primary": True, "verified": False},
+                       ])
+        with TestClient(app) as c:
+            ck, st = self._state_handshake(c)
+            resp = c.get(f"/api/auth/oauth/github/callback?code=abc&state={st}",
+                         cookies=ck, follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert "error=domain_not_allowed" in resp.headers["location"]
+            assert not resp.cookies.get("access_token"), "must NOT issue a session cookie"
+
+    def test_github_no_public_email_empty_emails_response_fail_closed(self, app, monkeypatch):
+        """REGRESSION for V7 (empty-email path, isolated): when /user has no
+        public email AND the /user/emails response yields no usable address
+        (empty list — no verified entries, or scope wasn't granted), email stays
+        empty and domain becomes "". With OAUTH_ALLOWED_DOMAINS set, the user
+        must be rejected fail-closed. The V7 bug (`and domain` short-circuit)
+        would admit this user because `domain == ""` is falsy; the fix makes
+        `"" not in OAUTH_ALLOWED_DOMAINS` True → rejected."""
+        m = self._enable(monkeypatch)
+        self._stub_token(monkeypatch)
+        self._stub_get(monkeypatch,
+                       user_payload={"login": "gh-nobody", "email": None},
+                       emails_payload=[])
+        with TestClient(app) as c:
+            ck, st = self._state_handshake(c)
+            resp = c.get(f"/api/auth/oauth/github/callback?code=abc&state={st}",
+                         cookies=ck, follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert "error=domain_not_allowed" in resp.headers["location"]
+            assert not resp.cookies.get("access_token"), "must NOT issue a session cookie"
+
+
+# ── Share-link access control (Vulns 1 + 2) ──────────────────────────────
+
+class TestShareLinkAccessControl:
+    """V1: create_share_link must require read on the target bucket.
+    V2: list_share_links must drop the secret token column and show non-admins
+    only their own rows."""
+
+    def test_viewer_cannot_create_share_link_for_foreign_bucket(self, client, viewer_cookies):
+        """A viewer with no bucket grants must NOT be able to mint a share link
+        for an arbitrary bucket (V1 negative)."""
+        if not viewer_cookies:
+            pytest.skip("Viewer user not created")
+        bucket = f"foreign-bucket-{uuid.uuid4().hex[:8]}"
+        resp = client.post(
+            "/api/share-links",
+            json={"bucket": bucket, "key": "k.txt", "expires_hours": 24},
+            cookies=viewer_cookies,
+        )
+        assert resp.status_code == 403, resp.text
+
+    def test_viewer_can_create_share_link_for_granted_bucket(self, client, admin_cookies, viewer_cookies):
+        """Positive regression: once a viewer is granted read on a bucket, they
+        CAN create a share link for it. Proves legit access still works."""
+        if not viewer_cookies:
+            pytest.skip("Viewer user not created")
+        try:
+            from backend.main import _get_users_db
+        except ModuleNotFoundError:
+            from main import _get_users_db
+        bucket = f"granted-bucket-{uuid.uuid4().hex[:8]}"
+        # Grant test-viewer read on the bucket directly via the DB.
+        with _get_users_db() as db:
+            db.execute(
+                "INSERT INTO bucket_permissions (username, bucket, permission, granted_by) VALUES (?, ?, ?, ?)",
+                ("test-viewer", bucket, "read", "admin"),
+            )
+            db.commit()
+        resp = client.post(
+            "/api/share-links",
+            json={"bucket": bucket, "key": "k.txt", "expires_hours": 24},
+            cookies=viewer_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "token" in data and data["token"]
+
+    def test_list_share_links_omits_token_and_filters_by_owner(
+        self, client, admin_cookies, viewer_cookies
+    ):
+        """V2: the secret `token` column is never returned, and non-admins see
+        only their own rows (admins see all)."""
+        if not viewer_cookies:
+            pytest.skip("Viewer user not created")
+        try:
+            from backend.main import _get_users_db
+        except ModuleNotFoundError:
+            from main import _get_users_db
+
+        # Stand up two links with distinct owners on unique buckets.
+        admin_bucket = f"ac-admin-{uuid.uuid4().hex[:8]}"
+        viewer_bucket = f"ac-viewer-{uuid.uuid4().hex[:8]}"
+        with _get_users_db() as db:
+            db.execute(
+                "INSERT INTO bucket_permissions (username, bucket, permission, granted_by) VALUES (?, ?, ?, ?)",
+                ("test-viewer", viewer_bucket, "read", "admin"),
+            )
+            db.commit()
+
+        # Admin creates a link on admin_bucket.
+        resp = client.post(
+            "/api/share-links",
+            json={"bucket": admin_bucket, "key": "a.txt", "expires_hours": 24},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+        # Viewer creates a link on viewer_bucket (granted above).
+        resp = client.post(
+            "/api/share-links",
+            json={"bucket": viewer_bucket, "key": "v.txt", "expires_hours": 24},
+            cookies=viewer_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+
+        # Viewer list: only own rows, never any token.
+        resp = client.get("/api/share-links", cookies=viewer_cookies)
+        assert resp.status_code == 200, resp.text
+        viewer_links = resp.json()["links"]
+        assert viewer_links, "viewer should see at least one own link"
+        assert all(link["created_by"] == "test-viewer" for link in viewer_links), \
+            "viewer must see ONLY their own rows"
+        assert all("token" not in link for link in viewer_links), \
+            "token column must not be exposed"
+
+        # Admin list: sees all rows (at least the two we just created), no token.
+        resp = client.get("/api/share-links", cookies=admin_cookies)
+        assert resp.status_code == 200, resp.text
+        admin_links = resp.json()["links"]
+        owners = {link["created_by"] for link in admin_links}
+        assert "admin" in owners and "test-viewer" in owners, \
+            "admin must see rows from multiple owners"
+        assert all("token" not in link for link in admin_links), \
+            "token column must not be exposed"
+
+
+# ── S3 Index Metadata Leak (V9) ──────────────────────────
+
+class TestS3IndexMetadataLeak:
+    """A4 / Vuln 9: in AUTH_MODE=s3 every session JWT has role=admin, so the old
+    admin short-circuit in _check_compat_bucket_read let any s3 user read the LOCAL
+    index (built with server creds) — leaking metadata of buckets their IAM denies.
+    The fix gates the compat read routes by the user's own IAM."""
+
+    def _enable_s3(self, monkeypatch, allow=False):
+        """Flip AUTH_MODE=s3, point _DEFAULT_BUCKET at a known name, and stub the
+        IAM access probe so we can deterministically allow/deny the user."""
+        try:
+            import backend.main as m
+        except ModuleNotFoundError:
+            import main as m
+        monkeypatch.setattr(m, "AUTH_MODE", "s3")
+        monkeypatch.setattr(m, "_DEFAULT_BUCKET", "default-bucket-leak-test")
+        monkeypatch.setattr(m, "_s3_user_can_access", lambda creds, eid, bucket: allow)
+        return m
+
+    def _s3_cookie(self, m):
+        """Forge a valid s3-mode session cookie so endpoint_routing_middleware binds
+        the user's creds into _user_creds_ctx for the duration of the request."""
+        import jwt
+        from datetime import datetime, timezone, timedelta
+        token = jwt.encode(
+            {"sub": "s3:testakid", "role": "admin", "eid": "default",
+             "s3ak": m._encrypt("AKIAFAKEACCESSKEY123"),
+             "s3sk": m._encrypt("fakeSecretKey456"),
+             "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
+            m.JWT_SECRET, algorithm="HS256")
+        return {"access_token": token}
+
+    def test_s3_user_denied_default_bucket_returns_403(self, app, monkeypatch):
+        """Negative (core V9): an s3-mode user whose IAM cannot reach the default
+        bucket must be 403'd on ALL five compat index read routes — proving the
+        index is no longer leaked through any of them."""
+        m = self._enable_s3(monkeypatch, allow=False)
+        cookie = self._s3_cookie(m)
+        paths = [
+            "/api/list",
+            "/api/search?q=x",
+            "/api/folder-size",
+            "/api/storage-breakdown",
+            "/api/crawl-status",
+        ]
+        with TestClient(app) as c:
+            for path in paths:
+                resp = c.get(path, cookies=cookie)
+                assert resp.status_code == 403, \
+                    f"{path} should be denied (IAM denies default bucket), got {resp.status_code}"
+
+    def test_password_mode_admin_still_passes_compat_check(self, client, admin_cookies, monkeypatch):
+        """Positive regression: in PASSWORD mode (AUTH_MODE=local, default), an admin must
+        still pass _check_compat_bucket_read via the admin bypass — i.e. the V9 rewrite
+        must not have broken the non-s3 path. We force _DEFAULT_BUCKET non-empty and stub
+        crawl_status so the handler actually reaches _check_compat_bucket_read instead of
+        short-circuiting at the no_bucket guard."""
+        try:
+            import backend.main as m
+        except ModuleNotFoundError:
+            import main as m
+        monkeypatch.setattr(m, "_DEFAULT_BUCKET", "any-bucket-for-regression")
+        monkeypatch.setattr(m, "crawl_status", lambda bucket: {"status": "ok"})
+        resp = client.get("/api/crawl-status", cookies=admin_cookies)
+        assert resp.status_code != 403, "password-mode admin must not be 403'd by the rewrite"
+
+    def test_s3_user_allowed_default_bucket_not_blocked(self, app, monkeypatch):
+        """Positive: when the s3 user's IAM ALLOWS the default bucket, _check_compat_bucket_read
+        returns cleanly (no 403) and the route proceeds. Proves the gate doesn't false-positive
+        and that the successful-s3 'return' doesn't fall through to the password-mode branch."""
+        m = self._enable_s3(monkeypatch, allow=True)   # _s3_user_can_access -> True
+        monkeypatch.setattr(m, "crawl_status", lambda bucket: {"status": "ok"})
+        with TestClient(app) as c:
+            resp = c.get("/api/crawl-status", cookies=self._s3_cookie(m))
+        assert resp.status_code == 200, f"s3 user with IAM-allow should proceed, got {resp.status_code}"
+        assert resp.json()["status"] == "ok"
+
+
+# ── S3 Token Privilege Escalation (V4) ───────────────────
+
+class TestS3TokenPrivilegeEscalation:
+    """A3 / Vuln 4: in AUTH_MODE=s3 every session JWT has role=admin, so without the
+    fix a read-only IAM user could (1) mint a server-credentialed API token, and
+    (2) use any API token to bypass the per-user IAM binding entirely. The fix
+    blocks s3-mode callers from create_token AND refuses Bearer auth in s3 mode."""
+
+    def _s3_cookie(self, m, sub="s3:testakid"):
+        """Forge a valid s3-mode session cookie (signed with JWT_SECRET, carrying
+        encrypted s3ak/s3sk) — same shape auth_login_s3 produces."""
+        import jwt
+        token = jwt.encode(
+            {"sub": sub, "role": "admin", "eid": "default",
+             "s3ak": m._encrypt("AKIAFAKEACCESSKEY123"),
+             "s3sk": m._encrypt("fakeSecretKey456"),
+             "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
+            m.JWT_SECRET, algorithm="HS256")
+        return {"access_token": token}
+
+    def test_s3_user_cannot_create_api_token(self, app, monkeypatch):
+        """Negative (core V4 part 1): an s3-mode session (role=admin via the s3
+        login path) must NOT be able to mint an API token. create_token rejects any
+        caller whose JWT sub starts with 's3:'."""
+        try:
+            import backend.main as m
+        except ModuleNotFoundError:
+            import main as m
+        monkeypatch.setattr(m, "AUTH_MODE", "s3")
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.post(
+                "/api/auth/tokens",
+                json={"name": "x", "role": "viewer"},
+                cookies=cookie,
+            )
+        assert resp.status_code == 403, \
+            f"s3-mode session must not mint API tokens, got {resp.status_code}"
+
+    def test_s3_mode_bearer_auth_refused(self, app, client, admin_cookies, monkeypatch):
+        """Negative (core V4 part 2): a previously-valid API token (minted in local
+        mode) must be REFUSED once AUTH_MODE=s3. The refusal happens at the top of
+        get_current_user's Bearer branch, before _verify_api_token is consulted."""
+        # Mint the token in local mode (default), where it is legitimate.
+        resp = client.post(
+            "/api/auth/tokens",
+            json={"name": "s3-bearer-block", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        raw_token = resp.json()["token"]
+
+        # Flip into s3 mode — Bearer auth must now be refused.
+        try:
+            import backend.main as m
+        except ModuleNotFoundError:
+            import main as m
+        monkeypatch.setattr(m, "AUTH_MODE", "s3")
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 401, \
+            f"Bearer auth must be refused in s3 mode, got {resp.status_code}"
+
+    def test_local_admin_can_still_create_token_and_bearer_still_works(self, client, admin_cookies):
+        """Positive regression: in AUTH_MODE=local (default, NOT flipped), the s3:
+        prefix check must not fire and Bearer auth must still work. Guards against
+        the fix over-reaching into local mode."""
+        resp = client.post(
+            "/api/auth/tokens",
+            json={"name": "local-still-works", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        raw_token = resp.json()["token"]
+        assert raw_token.startswith("sairo_")
+
+        resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["username"] == "admin"
+        assert data["role"] == "viewer"
+
+
+# ── OAuth state + PKCE (Vuln 5: login CSRF) ──────────────
+
+class TestOAuthStatePkce:
+    """A5 / Vuln 5: oauth_start/oauth_callback previously sent no state, nonce,
+    or PKCE — unlike the OIDC path. A login-CSRF attacker could trick a victim
+    into landing logged in as the attacker. The fix adds a signed state cookie
+    + S256 PKCE challenge/verifier, shared with the OIDC path via the
+    _sign_state_cookie / _verify_state_cookie / _set_state_cookie helpers."""
+
+    def _enable_google(self, monkeypatch):
+        m = _main_module()
+        monkeypatch.setattr(m, "OAUTH_GOOGLE_CLIENT_ID", "g-client")
+        monkeypatch.setattr(m, "OAUTH_GOOGLE_CLIENT_SECRET", "g-secret")
+        monkeypatch.setattr(m, "OAUTH_DEFAULT_ROLE", "viewer")
+        monkeypatch.setattr(m, "OAUTH_ALLOWED_DOMAINS", [])
+        return m
+
+    def test_oauth_start_sets_state_cookie_and_pkce_params(self, app, monkeypatch):
+        """oauth_start must redirect with state + S256 PKCE params and set a
+        signed oauth_state cookie carrying purpose=oauth_state + the verifier."""
+        import jwt as _jwt
+        m = self._enable_google(monkeypatch)
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/google/login", follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            loc = resp.headers["location"]
+            assert loc.startswith("https://accounts.google.com/o/oauth2/v2/auth?")
+            assert "state=" in loc
+            assert "code_challenge=" in loc
+            assert "code_challenge_method=S256" in loc
+            cookie = resp.cookies.get("oauth_state")
+            assert cookie, "oauth_state cookie must be set"
+            claims = _jwt.decode(cookie, m.JWT_SECRET, algorithms=["HS256"])
+            assert claims["purpose"] == "oauth_state"
+            assert claims.get("cv"), "PKCE verifier must be stashed in the cookie"
+
+    def test_oauth_callback_without_state_cookie_returns_401(self, app, monkeypatch):
+        """Core V5 negative #1: a callback with no oauth_state cookie must be
+        hard-rejected with 401 (the security boundary), not a silent redirect."""
+        self._enable_google(monkeypatch)
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/google/callback?code=x&state=y",
+                         follow_redirects=False)
+            assert resp.status_code == 401
+
+    def test_oauth_callback_state_mismatch_returns_401(self, app, monkeypatch):
+        """Core V5 negative #2: an oauth_state cookie whose state doesn't match
+        the query param (compare_digest fails) must be hard-rejected with 401."""
+        m = self._enable_google(monkeypatch)
+        forged = m._sign_state_cookie(
+            {"state": "REAL", "cv": "v", "purpose": "oauth_state"})
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/google/callback?code=x&state=ATTACKER",
+                         cookies={"oauth_state": forged}, follow_redirects=False)
+            assert resp.status_code == 401
+
+    def test_oauth_callback_happy_path_with_state_and_pkce(self, app, monkeypatch):
+        """End-to-end: real oauth_start cookie + matching state → session cookie,
+        and the recorded token-exchange request MUST carry the PKCE code_verifier
+        from the state cookie (proves PKCE is sent, not just advertised)."""
+        import jwt as _jwt
+        from types import SimpleNamespace
+        m = self._enable_google(monkeypatch)
+        email = f"happy-oauth-{uuid.uuid4().hex[:8]}@example.com"
+
+        recorded = {}
+
+        def _post(url, *a, **k):
+            recorded["url"] = url
+            recorded["data"] = k.get("data")
+            return SimpleNamespace(status_code=200, json=lambda: {"access_token": "tok"})
+
+        def _get(url, *a, **k):
+            return SimpleNamespace(status_code=200,
+                                   json=lambda: {"email": email})
+
+        monkeypatch.setattr("httpx.post", _post)
+        monkeypatch.setattr("httpx.get", _get)
+
+        with TestClient(app) as c:
+            # 1) start → obtain the real signed cookie + matching state param
+            start = c.get("/api/auth/oauth/google/login", follow_redirects=False)
+            cookie = start.cookies.get("oauth_state")
+            from urllib.parse import urlparse, parse_qs
+            state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+            # decode the verifier to compare against what the callback sends
+            st = _jwt.decode(cookie, m.JWT_SECRET, algorithms=["HS256"])
+            cv_expected = st["cv"]
+
+            # 2) callback with the matching state + cookie
+            resp = c.get(f"/api/auth/oauth/google/callback?code=abc&state={state}",
+                         cookies={"oauth_state": cookie}, follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert resp.headers["location"] == "/"
+            assert resp.cookies.get("access_token"), "session cookie must be set"
+
+        # 3) the token-exchange request carried the PKCE verifier
+        assert recorded.get("url") == "https://oauth2.googleapis.com/token"
+        assert recorded["data"].get("code_verifier") == cv_expected, \
+            "token exchange must send the PKCE verifier from the state cookie"
