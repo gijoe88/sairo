@@ -1,5 +1,7 @@
-# Stage 1: Build React frontend (always amd64 — output is static JS/CSS/HTML)
-FROM --platform=linux/amd64 node:20-alpine AS frontend-build
+# Stage 1: Build React frontend on the build host's native arch (avoids QEMU
+# emulation of esbuild/rollup native binaries). Output is static JS/CSS/HTML,
+# so it is platform-portable and copied into any target-arch stage 2.
+FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-build
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm install
