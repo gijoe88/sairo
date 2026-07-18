@@ -113,8 +113,10 @@ async def security_headers_middleware(request: Request, call_next):
 
 def _extract_s3_session(request: Request):
     """For AUTH_MODE=s3 cookie sessions, decode the JWT and return the user's
-    {ak, sk, eid} (decrypted). Returns None otherwise (password mode, API tokens,
-    no/invalid cookie). API-token (Bearer) sessions intentionally keep server creds."""
+    {ak, sk, eid} (decrypted). Returns None otherwise (password mode, or no/invalid
+    cookie). In S3 mode, Bearer (API-token) auth is refused entirely in
+    get_current_user, so every authenticated request is bound to the logged-in
+    user's own IAM keys via this cookie path."""
     if AUTH_MODE != "s3":
         return None
     token = request.cookies.get("access_token")
@@ -760,6 +762,8 @@ def get_current_user(request: Request):
     # Check Bearer token first
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
+        if AUTH_MODE == "s3":
+            raise HTTPException(401, "API token auth is disabled in S3 mode; use the session cookie")
         token_str = auth_header[7:]
         user = _verify_api_token(token_str)
         if user:
@@ -3366,6 +3370,8 @@ def list_tokens(user: dict = Depends(require_admin)):
 @app.post("/api/auth/tokens")
 def create_token(req: CreateTokenRequest, user: dict = Depends(require_admin)):
     import hashlib
+    if user["username"].startswith("s3:"):
+        raise HTTPException(403, "S3-mode sessions cannot mint API tokens")
     if req.role not in ("admin", "viewer"):
         raise HTTPException(400, "Role must be 'admin' or 'viewer'")
     raw_token = f"sairo_{secrets.token_urlsafe(32)}"

@@ -1331,3 +1331,86 @@ class TestS3IndexMetadataLeak:
             resp = c.get("/api/crawl-status", cookies=self._s3_cookie(m))
         assert resp.status_code == 200, f"s3 user with IAM-allow should proceed, got {resp.status_code}"
         assert resp.json()["status"] == "ok"
+
+
+# ── S3 Token Privilege Escalation (V4) ───────────────────
+
+class TestS3TokenPrivilegeEscalation:
+    """A3 / Vuln 4: in AUTH_MODE=s3 every session JWT has role=admin, so without the
+    fix a read-only IAM user could (1) mint a server-credentialed API token, and
+    (2) use any API token to bypass the per-user IAM binding entirely. The fix
+    blocks s3-mode callers from create_token AND refuses Bearer auth in s3 mode."""
+
+    def _s3_cookie(self, m, sub="s3:testakid"):
+        """Forge a valid s3-mode session cookie (signed with JWT_SECRET, carrying
+        encrypted s3ak/s3sk) — same shape auth_login_s3 produces."""
+        import jwt
+        token = jwt.encode(
+            {"sub": sub, "role": "admin", "eid": "default",
+             "s3ak": m._encrypt("AKIAFAKEACCESSKEY123"),
+             "s3sk": m._encrypt("fakeSecretKey456"),
+             "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
+            m.JWT_SECRET, algorithm="HS256")
+        return {"access_token": token}
+
+    def test_s3_user_cannot_create_api_token(self, app, monkeypatch):
+        """Negative (core V4 part 1): an s3-mode session (role=admin via the s3
+        login path) must NOT be able to mint an API token. create_token rejects any
+        caller whose JWT sub starts with 's3:'."""
+        try:
+            import backend.main as m
+        except ModuleNotFoundError:
+            import main as m
+        monkeypatch.setattr(m, "AUTH_MODE", "s3")
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.post(
+                "/api/auth/tokens",
+                json={"name": "x", "role": "viewer"},
+                cookies=cookie,
+            )
+        assert resp.status_code == 403, \
+            f"s3-mode session must not mint API tokens, got {resp.status_code}"
+
+    def test_s3_mode_bearer_auth_refused(self, app, client, admin_cookies, monkeypatch):
+        """Negative (core V4 part 2): a previously-valid API token (minted in local
+        mode) must be REFUSED once AUTH_MODE=s3. The refusal happens at the top of
+        get_current_user's Bearer branch, before _verify_api_token is consulted."""
+        # Mint the token in local mode (default), where it is legitimate.
+        resp = client.post(
+            "/api/auth/tokens",
+            json={"name": "s3-bearer-block", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        raw_token = resp.json()["token"]
+
+        # Flip into s3 mode — Bearer auth must now be refused.
+        try:
+            import backend.main as m
+        except ModuleNotFoundError:
+            import main as m
+        monkeypatch.setattr(m, "AUTH_MODE", "s3")
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 401, \
+            f"Bearer auth must be refused in s3 mode, got {resp.status_code}"
+
+    def test_local_admin_can_still_create_token_and_bearer_still_works(self, client, admin_cookies):
+        """Positive regression: in AUTH_MODE=local (default, NOT flipped), the s3:
+        prefix check must not fire and Bearer auth must still work. Guards against
+        the fix over-reaching into local mode."""
+        resp = client.post(
+            "/api/auth/tokens",
+            json={"name": "local-still-works", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        raw_token = resp.json()["token"]
+        assert raw_token.startswith("sairo_")
+
+        resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["username"] == "admin"
+        assert data["role"] == "viewer"
