@@ -575,10 +575,16 @@ def _init_users_db():
             expires_at TEXT NOT NULL,
             download_count INTEGER DEFAULT 0,
             max_downloads INTEGER,
-            password_hash TEXT
+            password_hash TEXT,
+            endpoint_id TEXT NOT NULL DEFAULT 'default'
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_share_token ON share_links(token)")
+    # endpoint_id (additive migration for existing DBs)
+    try:
+        conn.execute("ALTER TABLE share_links ADD COLUMN endpoint_id TEXT NOT NULL DEFAULT 'default'")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     # License keys table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS license_info (
@@ -692,6 +698,36 @@ _init_users_db()
 
 
 # ── Auth Helpers ─────────────────────────────────────────────────────────────
+
+def _caller_can_read_bucket(user: dict, bucket: str, request: Request) -> bool:
+    """True if `user` is authorized to read `bucket`.
+
+    Single chokepoint for share-link authorization (and reusable elsewhere).
+    Mirrors the bucket-permission middleware's logic but in a form callable from
+    route handlers that need to authorize against a bucket mentioned in the
+    request body (which the path-based middleware cannot see).
+
+    * admins always pass;
+    * in AUTH_MODE=s3 the provider's IAM is the source of truth (cached
+      head_bucket via the request-bound user creds);
+    * in AUTH_MODE=local a row in bucket_permissions is required.
+    """
+    if user.get("role") == "admin":
+        return True
+    elif AUTH_MODE == "s3":
+        creds = _user_creds_ctx.get(None)
+        endpoint_id = _endpoint_ctx.get("default")
+        if not creds or not creds.get("ak"):
+            return False
+        return _s3_user_can_access(creds, endpoint_id, bucket)
+    else:
+        with _get_users_db() as db:
+            row = db.execute(
+                "SELECT permission FROM bucket_permissions WHERE username=? AND bucket=?",
+                (user.get("username"), bucket)
+            ).fetchone()
+        return row is not None
+
 
 def _verify_api_token(token_str: str):
     """Verify a Bearer API token. Returns {username, role} or None."""
@@ -3368,29 +3404,49 @@ class CreateShareLinkRequest(BaseModel):
     password: Optional[str] = None
 
 @app.post("/api/share-links")
-def create_share_link(req: CreateShareLinkRequest, user: dict = Depends(get_current_user)):
+def create_share_link(req: CreateShareLinkRequest, request: Request, user: dict = Depends(get_current_user)):
+    # Authorization: caller must already be able to read the bucket they're
+    # minting a presigned share link for. Without this, any viewer could mint
+    # a share link for ANY bucket/key (V1).
+    if not _caller_can_read_bucket(user, req.bucket, request):
+        raise HTTPException(403, "No access to this bucket")
     token = secrets.token_urlsafe(24)
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=req.expires_hours)).isoformat()
     password_hash = bcrypt.hash(req.password) if req.password else None
     with _get_users_db() as db:
         db.execute(
-            "INSERT INTO share_links (token, bucket, key, created_by, expires_at, max_downloads, password_hash) VALUES (?,?,?,?,?,?,?)",
-            (token, req.bucket, req.key, user["username"], expires_at, req.max_downloads, password_hash))
+            "INSERT INTO share_links (token, bucket, key, created_by, expires_at, max_downloads, password_hash, endpoint_id) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (token, req.bucket, req.key, user["username"], expires_at, req.max_downloads, password_hash, _endpoint_ctx.get("default")))
         db.commit()
     _audit("create_share_link", user["username"], bucket=req.bucket, details=f"key={req.key}")
     return {"token": token, "url": f"/share/{token}", "expires_at": expires_at}
 
 @app.get("/api/share-links")
 def list_share_links(bucket: str = "", user: dict = Depends(get_current_user)):
+    # Never expose the secret token column to list callers — only the resolver
+    # (/api/share/{token}) should accept it (V2). Non-admins see only their own
+    # rows; admins see all rows, optionally filtered by bucket.
+    cols = "id, bucket, key, created_by, created_at, expires_at, download_count, max_downloads"
     with _get_users_db() as db:
-        if bucket:
-            rows = db.execute(
-                "SELECT id, token, bucket, key, created_by, created_at, expires_at, download_count, max_downloads FROM share_links WHERE bucket=? ORDER BY created_at DESC",
-                (bucket,)).fetchall()
+        if user["role"] != "admin":
+            if bucket:
+                rows = db.execute(
+                    f"SELECT {cols} FROM share_links WHERE bucket=? AND created_by=? ORDER BY created_at DESC",
+                    (bucket, user["username"])).fetchall()
+            else:
+                rows = db.execute(
+                    f"SELECT {cols} FROM share_links WHERE created_by=? ORDER BY created_at DESC",
+                    (user["username"],)).fetchall()
         else:
-            rows = db.execute(
-                "SELECT id, token, bucket, key, created_by, created_at, expires_at, download_count, max_downloads FROM share_links ORDER BY created_at DESC"
-            ).fetchall()
+            if bucket:
+                rows = db.execute(
+                    f"SELECT {cols} FROM share_links WHERE bucket=? ORDER BY created_at DESC",
+                    (bucket,)).fetchall()
+            else:
+                rows = db.execute(
+                    f"SELECT {cols} FROM share_links ORDER BY created_at DESC"
+                ).fetchall()
     return {"links": [dict(r) for r in rows]}
 
 @app.delete("/api/share-links/{link_id}")
@@ -3428,11 +3484,19 @@ def resolve_share_link(token: str, password: str = ""):
     if row["password_hash"]:
         if not password or not bcrypt.verify(password, row["password_hash"]):
             raise HTTPException(401, "Password required")
-    # Generate presigned URL
-    url = s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": row["bucket"], "Key": row["key"]},
-        ExpiresIn=3600)
+    # Generate presigned URL against the endpoint the link was created for.
+    # The resolver is public (no auth) so _endpoint_ctx is "default" here —
+    # without this switch, share links minted on a non-default endpoint would
+    # resolve against the wrong S3 and 400/404.
+    eid = row.get("endpoint_id") or "default"
+    t_e = _endpoint_ctx.set(eid)
+    try:
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": row["bucket"], "Key": row["key"]},
+            ExpiresIn=3600)
+    finally:
+        _endpoint_ctx.reset(t_e)
     # Update download count
     with _get_users_db() as db:
         db.execute("UPDATE share_links SET download_count = download_count + 1 WHERE token=?", (token,))

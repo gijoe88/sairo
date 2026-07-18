@@ -1148,3 +1148,107 @@ class TestGithubAllowedDomains:
             assert resp.status_code in (302, 307)
             assert "error=domain_not_allowed" in resp.headers["location"]
             assert not resp.cookies.get("access_token"), "must NOT issue a session cookie"
+
+
+# ── Share-link access control (Vulns 1 + 2) ──────────────────────────────
+
+class TestShareLinkAccessControl:
+    """V1: create_share_link must require read on the target bucket.
+    V2: list_share_links must drop the secret token column and show non-admins
+    only their own rows."""
+
+    def test_viewer_cannot_create_share_link_for_foreign_bucket(self, client, viewer_cookies):
+        """A viewer with no bucket grants must NOT be able to mint a share link
+        for an arbitrary bucket (V1 negative)."""
+        if not viewer_cookies:
+            pytest.skip("Viewer user not created")
+        bucket = f"foreign-bucket-{uuid.uuid4().hex[:8]}"
+        resp = client.post(
+            "/api/share-links",
+            json={"bucket": bucket, "key": "k.txt", "expires_hours": 24},
+            cookies=viewer_cookies,
+        )
+        assert resp.status_code == 403, resp.text
+
+    def test_viewer_can_create_share_link_for_granted_bucket(self, client, admin_cookies, viewer_cookies):
+        """Positive regression: once a viewer is granted read on a bucket, they
+        CAN create a share link for it. Proves legit access still works."""
+        if not viewer_cookies:
+            pytest.skip("Viewer user not created")
+        try:
+            from backend.main import _get_users_db
+        except ModuleNotFoundError:
+            from main import _get_users_db
+        bucket = f"granted-bucket-{uuid.uuid4().hex[:8]}"
+        # Grant test-viewer read on the bucket directly via the DB.
+        with _get_users_db() as db:
+            db.execute(
+                "INSERT INTO bucket_permissions (username, bucket, permission, granted_by) VALUES (?, ?, ?, ?)",
+                ("test-viewer", bucket, "read", "admin"),
+            )
+            db.commit()
+        resp = client.post(
+            "/api/share-links",
+            json={"bucket": bucket, "key": "k.txt", "expires_hours": 24},
+            cookies=viewer_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "token" in data and data["token"]
+
+    def test_list_share_links_omits_token_and_filters_by_owner(
+        self, client, admin_cookies, viewer_cookies
+    ):
+        """V2: the secret `token` column is never returned, and non-admins see
+        only their own rows (admins see all)."""
+        if not viewer_cookies:
+            pytest.skip("Viewer user not created")
+        try:
+            from backend.main import _get_users_db
+        except ModuleNotFoundError:
+            from main import _get_users_db
+
+        # Stand up two links with distinct owners on unique buckets.
+        admin_bucket = f"ac-admin-{uuid.uuid4().hex[:8]}"
+        viewer_bucket = f"ac-viewer-{uuid.uuid4().hex[:8]}"
+        with _get_users_db() as db:
+            db.execute(
+                "INSERT INTO bucket_permissions (username, bucket, permission, granted_by) VALUES (?, ?, ?, ?)",
+                ("test-viewer", viewer_bucket, "read", "admin"),
+            )
+            db.commit()
+
+        # Admin creates a link on admin_bucket.
+        resp = client.post(
+            "/api/share-links",
+            json={"bucket": admin_bucket, "key": "a.txt", "expires_hours": 24},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+        # Viewer creates a link on viewer_bucket (granted above).
+        resp = client.post(
+            "/api/share-links",
+            json={"bucket": viewer_bucket, "key": "v.txt", "expires_hours": 24},
+            cookies=viewer_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+
+        # Viewer list: only own rows, never any token.
+        resp = client.get("/api/share-links", cookies=viewer_cookies)
+        assert resp.status_code == 200, resp.text
+        viewer_links = resp.json()["links"]
+        assert viewer_links, "viewer should see at least one own link"
+        assert all(link["created_by"] == "test-viewer" for link in viewer_links), \
+            "viewer must see ONLY their own rows"
+        assert all("token" not in link for link in viewer_links), \
+            "token column must not be exposed"
+
+        # Admin list: sees all rows (at least the two we just created), no token.
+        resp = client.get("/api/share-links", cookies=admin_cookies)
+        assert resp.status_code == 200, resp.text
+        admin_links = resp.json()["links"]
+        owners = {link["created_by"] for link in admin_links}
+        assert "admin" in owners and "test-viewer" in owners, \
+            "admin must see rows from multiple owners"
+        assert all("token" not in link for link in admin_links), \
+            "token column must not be exposed"
