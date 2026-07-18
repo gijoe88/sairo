@@ -33,7 +33,6 @@ import hashlib
 import base64
 from cryptography.fernet import Fernet, InvalidToken
 from slowapi import Limiter
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from pricing import (
     get_storage_pricing, get_storage_price, estimate_monthly_cost as _estimate_monthly_cost,
@@ -65,7 +64,17 @@ UPLOAD_RATE_LIMIT = os.environ.get("UPLOAD_RATE_LIMIT", "30/minute")
 # when unset → TrustedProxyMiddleware is a complete no-op (existing behavior).
 TRUSTED_PROXIES = parse_trusted_proxies(os.environ.get("TRUSTED_PROXIES", ""))
 
-limiter = Limiter(key_func=get_remote_address, default_limits=[RATE_LIMIT])
+# Key on the ASGI-resolved client (request.client.host). TrustedProxyMiddleware
+# (outermost) rewrites scope["client"] to the real client IP when TRUSTED_PROXIES
+# is set, so the bucket is per real client behind a proxy. We intentionally do
+# NOT use slowapi.util.get_remote_address here: pinning this to request.client.host
+# makes the dependency on the resolved scope explicit and is robust against a
+# future slowapi change that might read X-Forwarded-For directly (which would
+# double-apply the XFF parse the middleware already did).
+limiter = Limiter(
+    key_func=lambda request: (request.client and request.client.host) or "unknown",
+    default_limits=[RATE_LIMIT],
+)
 app.state.limiter = limiter
 
 

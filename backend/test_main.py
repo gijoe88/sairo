@@ -12,6 +12,7 @@ import sys
 import json
 import base64
 import hashlib
+import ipaddress
 import time
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
@@ -29,6 +30,12 @@ os.environ.setdefault("DB_DIR", "/tmp/sairo-test")
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+from trusted_proxy import TrustedProxyMiddleware
 
 
 @pytest.fixture(scope="module")
@@ -952,4 +959,136 @@ class TestAuditClientIp:
         with m._get_users_db() as db:
             cols = [r["name"] for r in db.execute("PRAGMA table_info(audit_log)").fetchall()]
         assert "client_ip" in cols, f"client_ip missing from audit_log schema; got {cols!r}"
+
+
+# ── Rate-limiter keys (resolved client) ───────────────────
+
+def _make_login_rate_app(main_module, trusted_proxies):
+    """Tiny Starlette app that runs the REAL main._check_login_rate against the
+    resolved request.client.host, wrapped by TrustedProxyMiddleware. Used to prove
+    the login limiter buckets per resolved IP behind a proxy — without dragging in
+    the full FastAPI app/auth stack."""
+    check = main_module._check_login_rate
+
+    async def handler(request):
+        ip = request.client.host if request.client else None
+        check(ip)  # raises HTTPException(429) past LOGIN_RATE_MAX; one call per IP here
+        return JSONResponse({"key": ip})
+
+    app = Starlette(routes=[Route("/", handler)])
+    app.add_middleware(TrustedProxyMiddleware, trusted_proxies=trusted_proxies)
+    return app
+
+
+class TestRateLimiterResolvedKey:
+    """The slowapi Limiter and the custom login limiter BOTH key on the
+    ASGI-resolved client (request.client.host). TrustedProxyMiddleware rewrites
+    scope['client'] when TRUSTED_PROXIES is set, so each real client behind a
+    proxy gets its own bucket; an untrusted peer's X-Forwarded-For is ignored
+    (fail-closed)."""
+
+    def test_slowapi_key_func_reads_resolved_client(self):
+        """The configured slowapi key_func returns request.client.host (the
+        ASGI-resolved IP) and does NOT consult X-Forwarded-For — proving there is
+        no XFF double-application on top of TrustedProxyMiddleware. slowapi stores
+        the key_func on the Limiter instance as `_key_func`."""
+        m = _main_module()
+        # Real client IP is in scope["client"]; XFF header is a DISTRACTOR that
+        # must be ignored.
+        r = Request(scope={
+            "type": "http",
+            "client": ("203.0.113.9", 0),
+            "headers": [(b"x-forwarded-for", b"99.99.99.99")],
+        })
+        key = m.limiter._key_func(r)
+        assert key == "203.0.113.9", (
+            f"key_func must read request.client.host (the resolved IP), not "
+            f"X-Forwarded-For; got {key!r}"
+        )
+        # No client info → graceful fallback. (slowapi.util.get_remote_address
+        # returns '127.0.0.1' here; 'unknown' is the only cosmetic delta.)
+        r_none = Request(scope={"type": "http", "client": None, "headers": []})
+        assert m.limiter._key_func(r_none) == "unknown", (
+            "key_func must fall back to 'unknown' when request.client is None"
+        )
+
+    def test_login_limiter_buckets_per_resolved_ip_behind_trusted_proxy(self):
+        """HEADLINE: two requests from the SAME trusted proxy peer but DIFFERENT
+        X-Forwarded-For values land in SEPARATE _login_attempts buckets keyed by
+        the resolved XFF IP — NOT collapsed to the proxy peer. This proves
+        _check_login_rate(request.client.host) keys on the middleware-resolved IP."""
+        m = _main_module()
+        app = _make_login_rate_app(m, {ipaddress.ip_network("10.0.0.0/8")})
+        added = ["203.0.113.10", "198.51.100.20"]
+        try:
+            with TestClient(app, client=("10.0.0.1", 12345)) as c:
+                r1 = c.get("/", headers={"X-Forwarded-For": "203.0.113.10"})
+                assert r1.status_code == 200, r1.text
+                assert r1.json()["key"] == "203.0.113.10"
+                r2 = c.get("/", headers={"X-Forwarded-For": "198.51.100.20"})
+                assert r2.status_code == 200, r2.text
+                assert r2.json()["key"] == "198.51.100.20"
+            # Both resolved IPs land in separate buckets.
+            assert "203.0.113.10" in m._login_attempts, (
+                f"expected bucket for resolved XFF IP 203.0.113.10; "
+                f"_login_attempts keys = {list(m._login_attempts.keys())}"
+            )
+            assert "198.51.100.20" in m._login_attempts, (
+                f"expected bucket for resolved XFF IP 198.51.100.20; "
+                f"_login_attempts keys = {list(m._login_attempts.keys())}"
+            )
+            # The proxy peer itself must NOT have a bucket — that would indicate
+            # the two XFFs were collapsed onto the proxy.
+            assert "10.0.0.1" not in m._login_attempts, (
+                f"proxy peer 10.0.0.1 must NOT have its own bucket; "
+                f"_login_attempts keys = {list(m._login_attempts.keys())}"
+            )
+        finally:
+            # _login_attempts is a module-global; clean up so other tests aren't polluted.
+            for k in added:
+                m._login_attempts.pop(k, None)
+
+    def test_login_limiter_collapses_to_peer_when_untrusted(self):
+        """An UNTRUSTED peer's X-Forwarded-For is ignored (fail-closed), so the
+        login-limiter bucket is the peer IP itself — NOT the spoofed XFF value."""
+        m = _main_module()
+        app = _make_login_rate_app(m, {ipaddress.ip_network("10.0.0.0/8")})
+        added = ["8.8.8.8"]
+        try:
+            with TestClient(app, client=("8.8.8.8", 12345)) as c:
+                r = c.get("/", headers={"X-Forwarded-For": "203.0.113.10"})
+                assert r.status_code == 200, r.text
+                assert r.json()["key"] == "8.8.8.8"  # XFF ignored
+            assert "8.8.8.8" in m._login_attempts, (
+                f"expected bucket for untrusted peer 8.8.8.8; "
+                f"_login_attempts keys = {list(m._login_attempts.keys())}"
+            )
+            assert "203.0.113.10" not in m._login_attempts, (
+                f"spoofed XFF 203.0.113.10 must NOT get a bucket from an untrusted peer; "
+                f"_login_attempts keys = {list(m._login_attempts.keys())}"
+            )
+        finally:
+            for k in added:
+                m._login_attempts.pop(k, None)
+
+    def test_login_limiter_regression_default_config(self):
+        """Regression pin: with the module-scoped app (TRUSTED_PROXIES unset →
+        middleware no-op), _check_login_rate still buckets per plain IP argument.
+        Behavior is unchanged from before this PR."""
+        m = _main_module()
+        added = ["1.2.3.4", "5.6.7.8"]
+        try:
+            m._check_login_rate("1.2.3.4")
+            m._check_login_rate("5.6.7.8")
+            assert "1.2.3.4" in m._login_attempts, (
+                f"expected bucket for 1.2.3.4; "
+                f"_login_attempts keys = {list(m._login_attempts.keys())}"
+            )
+            assert "5.6.7.8" in m._login_attempts, (
+                f"expected bucket for 5.6.7.8; "
+                f"_login_attempts keys = {list(m._login_attempts.keys())}"
+            )
+        finally:
+            for k in added:
+                m._login_attempts.pop(k, None)
 
