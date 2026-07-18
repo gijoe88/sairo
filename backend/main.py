@@ -39,6 +39,7 @@ from pricing import (
     get_storage_pricing, get_storage_price, estimate_monthly_cost as _estimate_monthly_cost,
     detect_provider, get_all_providers, calculate_savings, STATIC_PRICING,
 )
+from trusted_proxy import TrustedProxyMiddleware, parse_trusted_proxies
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sairo")
@@ -58,6 +59,11 @@ app = FastAPI()
 # ── API Rate Limiting ──────────────────────────────────────────────────────
 RATE_LIMIT = os.environ.get("RATE_LIMIT", "120/minute")
 UPLOAD_RATE_LIMIT = os.environ.get("UPLOAD_RATE_LIMIT", "30/minute")
+
+# ── Trusted Proxies (X-Forwarded-* resolution) ──────────────────────────────
+# Parsed once at import so an invalid value fails fast (refuses to boot). Empty
+# when unset → TrustedProxyMiddleware is a complete no-op (existing behavior).
+TRUSTED_PROXIES = parse_trusted_proxies(os.environ.get("TRUSTED_PROXIES", ""))
 
 limiter = Limiter(key_func=get_remote_address, default_limits=[RATE_LIMIT])
 app.state.limiter = limiter
@@ -2436,9 +2442,11 @@ def _tel_active_buckets_24h() -> int:
 
 @app.middleware("http")
 async def telemetry_counter_middleware(request: Request, call_next):
-    """Outermost middleware — counts requests for anonymous telemetry. Strictly
-    pass-through: it never modifies the request/response and never swallows the
-    handler's exception (it re-raises after recording a failure)."""
+    """Pass-through telemetry counter — counts requests for anonymous telemetry.
+    Runs inside TrustedProxyMiddleware (which is outermost), so request.client is
+    already the resolved IP when this runs. Strictly pass-through: it never
+    modifies the request/response and never swallows the handler's exception (it
+    re-raises after recording a failure)."""
     if not TELEMETRY:
         return await call_next(request)
     try:
@@ -2454,6 +2462,17 @@ async def telemetry_counter_middleware(request: Request, call_next):
     except Exception:
         pass
     return response
+
+
+# ── Trusted Proxy Middleware (registered LAST → OUTERMOST) ───────────────────
+# Starlette's add_middleware() inserts at position 0 of user_middleware, so the
+# LAST add_middleware call becomes the OUTERMOST wrapper. Registered after every
+# @app.middleware("http") decorator above (security headers, bucket permission,
+# endpoint routing, telemetry counter) so it runs FIRST on the way in — every
+# downstream layer sees the rewritten client/scheme/host (audit-log client IP,
+# rate-limiter keys, SSO redirect URIs, request.base_url behind a proxy).
+# With TRUSTED_PROXIES unset this is a complete no-op (fail-closed default).
+app.add_middleware(TrustedProxyMiddleware, trusted_proxies=TRUSTED_PROXIES)
 
 
 def _meta_get(key: str, default=None):
