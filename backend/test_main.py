@@ -13,6 +13,7 @@ import json
 import base64
 import hashlib
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
@@ -857,3 +858,165 @@ class TestCompatPermissions:
                          "/api/presigned-url?key=test", "/api/multipart-uploads"]:
                 resp = fresh.get(path)
                 assert resp.status_code == 401, f"{path} should require auth, got {resp.status_code}"
+
+
+# ── Session & Token Revocation (V3/V8) ───────────────────
+
+class TestSessionAndTokenRevocation:
+    """A demoted or deleted admin must not be able to keep using their
+    existing session JWT or API token. Refresh and token-verify must
+    re-check the users table."""
+
+    def test_demoted_admin_refresh_returns_lower_role(self, client, admin_cookies):
+        """A demoted user's refresh should mint a JWT carrying the new (DB) role."""
+        uname = f"adm-demote-{uuid.uuid4().hex[:8]}"
+        pw = "testpass-demote-1234"
+
+        # Default admin creates a second admin
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": uname, "password": pw, "role": "admin"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+
+        # Second admin logs in to get their own cookie
+        resp = client.post("/api/auth/login", json={"username": uname, "password": pw})
+        assert resp.status_code == 200, resp.text
+        demoted_cookies = resp.cookies
+
+        # Default admin demotes them to viewer
+        resp = client.put(
+            f"/api/auth/users/{uname}",
+            json={"role": "viewer"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+
+        # Demoted user refreshes; the new JWT/cookie should reflect viewer
+        resp = client.post("/api/auth/refresh", cookies=demoted_cookies)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["role"] == "viewer"
+
+    def test_deleted_user_refresh_returns_401(self, client, admin_cookies):
+        """A deleted user's session cookie must stop working on refresh."""
+        uname = f"u-del-refresh-{uuid.uuid4().hex[:8]}"
+        pw = "testpass-delrefresh-1"
+
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": uname, "password": pw, "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+
+        resp = client.post("/api/auth/login", json={"username": uname, "password": pw})
+        assert resp.status_code == 200, resp.text
+        deleted_cookies = resp.cookies
+
+        # Default admin deletes the user
+        resp = client.delete(f"/api/auth/users/{uname}", cookies=admin_cookies)
+        assert resp.status_code == 200, resp.text
+
+        # Their cookie should no longer refresh
+        resp = client.post("/api/auth/refresh", cookies=deleted_cookies)
+        assert resp.status_code == 401, resp.text
+
+    def test_deleted_user_api_token_returns_401(self, client, admin_cookies):
+        """A deleted user's API token must immediately stop authenticating."""
+        uname = f"adm-del-token-{uuid.uuid4().hex[:8]}"
+        pw = "testpass-deltoken-12"
+
+        # Create a second admin (token creation requires admin)
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": uname, "password": pw, "role": "admin"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+
+        resp = client.post("/api/auth/login", json={"username": uname, "password": pw})
+        assert resp.status_code == 200, resp.text
+        second_admin_cookies = resp.cookies
+
+        # Second admin creates an API token
+        resp = client.post(
+            "/api/auth/tokens",
+            json={"name": "revoke-on-delete", "role": "admin"},
+            cookies=second_admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+        raw_token = resp.json()["token"]
+
+        # Token works before deletion
+        resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 200, resp.text
+
+        # Default admin deletes the user
+        resp = client.delete(f"/api/auth/users/{uname}", cookies=admin_cookies)
+        assert resp.status_code == 200, resp.text
+
+        # Token must no longer authenticate
+        resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 401, resp.text
+
+    def test_orphaned_api_token_rejected_after_owner_deleted(self, client, admin_cookies):
+        """Defense-in-depth: an api_tokens row whose owner users row is gone
+        (orphaned by a non-cascade delete) must be rejected by the INNER JOIN
+        in _verify_api_token — even though the token row itself still exists.
+
+        test_deleted_user_api_token_returns_401 above does NOT isolate this path:
+        auth_delete_user also runs `DELETE FROM api_tokens WHERE username=?`, so the
+        token row is gone and the JOIN is never the deciding factor. Here we leave the
+        api_tokens row in place by deleting only the users row directly.
+        """
+        try:
+            from backend.main import _get_users_db
+        except ModuleNotFoundError:
+            from main import _get_users_db
+
+        uname = f"u-orphan-{uuid.uuid4().hex[:8]}"
+        pw = "testpass-orphan-123"
+
+        # Admin creates a throwaway admin user (token creation requires admin)
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": uname, "password": pw, "role": "admin"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+
+        # That user logs in and creates an API token
+        resp = client.post("/api/auth/login", json={"username": uname, "password": pw})
+        assert resp.status_code == 200, resp.text
+        second_admin_cookies = resp.cookies
+
+        resp = client.post(
+            "/api/auth/tokens",
+            json={"name": "orphan-guard", "role": "admin"},
+            cookies=second_admin_cookies,
+        )
+        assert resp.status_code == 200, resp.text
+        raw_token = resp.json()["token"]
+
+        # Positive regression guard: token works while owner exists
+        resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 200, resp.text
+
+        # Delete ONLY the users row, leaving the api_tokens row orphaned.
+        # We bypass the delete endpoint so the api_tokens cascade does NOT run.
+        with _get_users_db() as db:
+            db.execute("DELETE FROM users WHERE username=?", (uname,))
+            db.commit()
+
+        # Confirm the api_tokens row is still there (orphaned) — this is what
+        # makes the INNER JOIN, not the token-row delete, the deciding factor.
+        with _get_users_db() as db:
+            row = db.execute(
+                "SELECT username FROM api_tokens WHERE username=?", (uname,)).fetchone()
+        assert row is not None, "orphaned api_tokens row should still exist"
+
+        # Negative case: the token row exists but its owner is gone, so the
+        # INNER JOIN users in _verify_api_token must reject it with 401.
+        resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 401, resp.text

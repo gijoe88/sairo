@@ -698,8 +698,12 @@ def _verify_api_token(token_str: str):
     import hashlib
     token_hash = hashlib.sha256(token_str.encode()).hexdigest()
     with _get_users_db() as db:
+        # JOIN on users so a token is rejected once its owner row is gone
+        # (defense-in-depth for deleted users).
         row = db.execute(
-            "SELECT username, role, expires_at FROM api_tokens WHERE token_hash=?",
+            "SELECT t.username, t.role, t.expires_at FROM api_tokens t "
+            "INNER JOIN users u ON u.username = t.username "
+            "WHERE t.token_hash=?",
             (token_hash,)).fetchone()
         if not row:
             return None
@@ -2991,12 +2995,20 @@ def auth_me(user: dict = Depends(get_current_user), request: Request = None):
 
 @app.post("/api/auth/refresh")
 def auth_refresh(user: dict = Depends(get_current_user)):
+    # Re-check the users table so a demoted or deleted user cannot keep
+    # using their old JWT role. The DB role wins over the JWT's role.
+    with _get_users_db() as db:
+        row = db.execute("SELECT role FROM users WHERE username=?",
+                         (user["username"],)).fetchone()
+    if not row:
+        raise HTTPException(401, "User no longer exists")
+    role = row["role"]
     token = jwt.encode(
-        {"sub": user["username"], "role": user["role"],
+        {"sub": user["username"], "role": role,
          "exp": datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS)},
         JWT_SECRET, algorithm="HS256")
     _secure_cookie = os.environ.get("SECURE_COOKIE", "true").lower() != "false"
-    response = JSONResponse({"username": user["username"], "role": user["role"],
+    response = JSONResponse({"username": user["username"], "role": role,
                              "expires_in": SESSION_HOURS * 3600})
     response.set_cookie("access_token", token, httponly=True, samesite="strict",
                         secure=_secure_cookie, max_age=SESSION_HOURS * 3600, path="/")
@@ -3044,6 +3056,7 @@ def auth_delete_user(username: str, user: dict = Depends(require_admin)):
             raise HTTPException(404, f"User '{username}' not found")
         db.execute("DELETE FROM users WHERE username=?", (username,))
         db.execute("DELETE FROM bucket_permissions WHERE username=?", (username,))
+        db.execute("DELETE FROM api_tokens WHERE username=?", (username,))
         db.commit()
     _audit("delete_user", user["username"], details=f"user={username}")
     return {"deleted": username}
@@ -3059,6 +3072,7 @@ def auth_update_user(username: str, req: UpdateUserRequest, user: dict = Depends
         if not existing:
             raise HTTPException(404, f"User '{username}' not found")
         db.execute("UPDATE users SET role=? WHERE username=?", (req.role, username))
+        db.execute("UPDATE api_tokens SET role=? WHERE username=?", (req.role, username))
         db.commit()
     _audit("update_user", user["username"], details=f"user={username}, role={req.role}")
     return {"updated": username, "role": req.role}
