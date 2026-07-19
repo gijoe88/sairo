@@ -140,8 +140,10 @@ GitHub branch domain check (`:3735`) is `if OAUTH_ALLOWED_DOMAINS and domain and
 1. Add a Starlette middleware on the FastMCP ASGI app that validates `Authorization: Bearer <token>` on **every** request against the Sairo `_verify_api_token` equivalent (HTTP 401 on miss/empty). Reach the app via `mcp.streamable_http_app()` (or whatever FastMCP exposes) and `app.add_middleware(...)`.
 2. Build a **per-request** `UserSession` from the validated token and stash it in `request.state`; change `_ctx_session(ctx)` in every tool to read from `request.state` instead of the shared lifespan dict. Audit attribution now points at the real caller.
 3. `MCP_DEV_MODE=true` admin fallback: restrict to loopback bind (`MCP_BIND_HOST=127.0.0.1`) only; refuse to mint the admin session when bound on a non-loopback interface.
-4. Resources (`mcp/resources/providers.py`) currently can't see the session (no `Context`) — at minimum enforce that resources are admin-only via the same middleware, or thread the per-request identity into them.
-5. Fix the docs (`website/src/content/docs/features/mcp.mdx`) that falsely claim "every tool call is gated by authentication" — but **docs go on fork `main`, not this PR branch**. Coordinate: code in PR 2, doc correction on `main`.
+4. **Fail closed when `SAIRO_API_TOKEN` is unset and `MCP_DEV_MODE=false`.** Currently `server.py:191-200` silently mints a `username="mcp-anonymous", role="viewer"` session in that case, which (combined with the lack of per-request auth) lets any client reach the `/mcp` route as a viewer. Replace the viewer fallback with `raise RuntimeError(...)` / `sys.exit(1)` at startup so a misconfigured production deploy fails loud and fast instead of running degraded.
+5. **Fix `SairoClient.get_user_permissions` to forward the caller's token.** Currently `sairo_client.py:101-103` calls `self._request(...)` with no `user_token` parameter, so the lookup runs under the server's own service token. Harmless under today's single-session model but **becomes a real authorization bypass** the moment fix #2 lands: per-user permission checks would all evaluate against the server's authority rather than the caller's. Add a `user_token: Optional[str] = None` parameter (mirror `preview_object` at `sairo_client.py:122-130`) and forward it from every caller in `mcp/auth.py` and `mcp/tools/*.py` that performs a permission lookup.
+6. Resources (`mcp/resources/providers.py`) currently can't see the session (no `Context`) and **perform no auth/authz of any kind** — they enumerate every per-bucket DB on disk and return bucket names / object counts / sizes / growth history. Two-layer fix: (a) apply the same Bearer middleware from fix #1 so unauthenticated clients can't reach them at all; (b) switch to FastMCP's context-aware resource handler form, thread the per-request identity, and enforce `require_bucket_read` per bucket inside each handler (for `storage_overview`, filter `bucket_dbs` through `session.can_read_bucket(bucket)` exactly as `tools/discovery.py:61-62` does). Until (b) lands, the minimum-risk mitigation is to disable both resources when the resolved session is non-admin.
+7. Fix the docs (`website/src/content/docs/features/mcp.mdx`) that falsely claim "every tool call is gated by authentication" and instruct operators to mint an **admin**-role token (should be least-privilege viewer by default) — but **docs go on fork `main`, not this PR branch**. Coordinate: code in PR 2, doc correction on `main`.
 
 **Risk flag (highest-risk item in the whole plan):** FastMCP's streamable-HTTP transport may not expose a clean middleware/seam; the PM must spike `mcp.streamable_http_app()` first. If FastMCP can't be secured at the transport level, the fallback is to run the MCP server behind a sidecar that injects auth, or to gate by `MCP_BIND_HOST=127.0.0.1` only + document that public exposure requires an auth-aware reverse proxy in front. This decision is **flagged for the user** because it shapes the MCP threat model.
 
@@ -253,3 +255,200 @@ Ordered by dependency. Each item maps to one or more atomic commits.
 3. **`TRUSTED_PROXIES` semantics.** Confirm CIDR list (recommended) vs hostname list (rejected — DNS-spoofable). Default empty = current behavior.
 4. **Docs vs. code split.** This design and AGENTS.md live on fork `main` only. The PM must cut PR branches from `upstream-main`, never from `main`. Verify before each PR that `git diff upstream-main...<branch>` contains no `docs/` or `AGENTS.md` changes.
 5. **Git rights.** Local branch/commit/push-to-origin are permitted by current tool rules; **opening PRs upstream via `gh`** and any force-push/rebase-on-shared-branch may need additional rights — flag when PR 1 is ready.
+6. **Depth of A8 fix (decision needed before PR 4 lands).** The `require_local_admin` chokepoint in §9.2 closes the exploit by breaking the chain at step 2 (`auth_create_user`). It does **not** address two deeper structural gaps that operators may or may not consider in-scope:
+   - `auth_login` (`main.py:2964`) is reachable in `AUTH_MODE=s3` — local login is always available. Combined with the always-seeded default admin (`main.py:697-708`), anyone who knows `ADMIN_PASS` can bypass S3/IAM entirely.
+   - `_init_users_db` (`main.py:697-708`) seeds the default local admin even in `AUTH_MODE=s3`.
+
+   **Default recommendation:** leave both as-is (the chokepoint is sufficient; emergency local admin access is a legitimate operator workflow). **Stricter option (flag for user):** gate `auth_login` on `AUTH_MODE != "s3"` AND skip default-admin seeding in S3 mode. This is reversible but changes operator expectations — do **not** include in PR 4 unless the user explicitly approves.
+
+---
+
+## 9. Post-v3.6.0 follow-up audit (A8 / A9)
+
+A full-project audit run after PRs 1 + 3 landed on `main` surfaced two additional issues in `backend/main.py`. Both are scoped to backend auth — no other audit area (SQL, path traversal, OIDC, crypto, frontend, Dockerfile, trusted-proxy) produced findings ≥ conf 7.
+
+> **Baseline drift note (housekeeping).** Line numbers and structural references in §9.2–§9.5 were authored against fork `main` (which carries v3.6.0 + trusted-proxy + audit-log-`client_ip` changes). PR 4 is cut from `upstream-main` (the v3.6.0 rollback), where line numbers are ~80–170 lower and two structures §9.5 referenced do **not** exist: (a) the inline `s3:` guard at `main.py:3422` (A3 was rolled back in v3.6.0 → nothing to delete; the chokepoint is the sole guard), and (b) `TestS3TokenPrivilegeEscalation` in `backend/test_main.py:1361-1440` (didn't exist on `upstream-main` → PM created it fresh at `test_main.py:864`). The PM identified all targets by name and applied the spec correctly; only the line numbers / "extend" wording were stale.
+
+### 9.1 Context
+
+| Ref | Title | Severity | Confidence | Status |
+|-----|-------|----------|------------|--------|
+| A8 | `AUTH_MODE=s3` session can mint a non-IAM-scoped local admin via `auth_create_user` → `auth_login` → `create_token` chain | HIGH | 9/10 | **Bypass of A3.** The v3.6.0 fix added the `s3:` guard only at `create_token` (`main.py:3422`); every other admin mutation route was missed. |
+| A9 | User / auth-provider enumeration via 500 on federated usernames (uncaught `bcrypt.verify` `ValueError`) | MEDIUM | 9/10 | **New.** Affects `auth_login`, `twofa_disable`, `auth_change_password`. |
+
+These ship together on one new PR (PR 4 below) because they are small, backend-only, and A9 is naturally co-located with A8's auth routes.
+
+### 9.2 A8 — S3-mode priv-esc bypass (HIGH, conf 9)
+
+**The bypass.** The A3 fix used a **syntactic guard** — `if user["username"].startswith("s3:"): raise 403` — applied at exactly one chokepoint (`create_token` at `main.py:3422`). Every other admin mutation route still passes `require_admin` and trusts the JWT's `role:"admin"`. The full chain:
+
+1. `POST /api/auth/login-s3` (`main.py:2997`, **not gated on `AUTH_MODE=="s3"`**) → admin cookie with `sub:"s3:AKIA…"` for any key pair that passes `list_buckets()` (including read-only IAM users).
+2. `POST /api/auth/users {"username":"backdoor","password":"Password123","role":"admin"}` (`main.py:3123`, `require_admin` only, **no `s3:` guard`) → local user row inserted.
+3. `POST /api/auth/login {"username":"backdoor",...}` (`main.py:2964`, **not gated on `AUTH_MODE`**) → new admin cookie with `sub:"backdoor"` (no `s3:` prefix).
+4. `POST /api/auth/tokens {"role":"admin"}` (`main.py:3420`) → passes the existing `s3:` guard because `sub="backdoor"` → returns a `sairo_…` admin API token.
+5. Attacker now holds a **persistent admin token not bound to the original IAM keys** and survives their revocation. Side attacks in the same chain: demote the operator's real admin (`PUT /api/auth/users/admin {"role":"viewer"}`) or delete legitimate users.
+
+**Root cause.** "Whack-a-mole" — applying a syntactic guard per-route is fragile; every future admin route has to remember it. The deeper issue is that `AUTH_MODE=s3` sessions carry `role:"admin"` (because the rest of the code uses `role=="admin"` as the sole capability check), so the role claim alone cannot distinguish "IAM-scoped admin" from "non-IAM-scoped admin." The `sub` prefix is the only signal.
+
+**Fix — introduce one structural chokepoint, not nine syntactic ones:**
+
+Add a new FastAPI dependency `require_local_admin` directly below `require_admin` (`main.py:822`):
+
+```python
+def require_local_admin(request: Request, user: dict = Depends(require_admin)):
+    """Admin routes that mutate non-IAM-scoped state (local users, API tokens,
+    endpoints, bucket grants, 2FA resets). In AUTH_MODE=s3, the session's
+    `role:"admin"` only reflects IAM capability (cached via list_buckets) —
+    it MUST NOT authorize changes to state outside the user's IAM scope."""
+    if AUTH_MODE == "s3" and user["username"].startswith("s3:"):
+        raise HTTPException(
+            403,
+            "S3-mode sessions cannot perform this action; "
+            "ask an admin with local/LDAP/OAuth/OIDC credentials.",
+        )
+    return user
+```
+
+Switch every admin mutation route that writes non-IAM-scoped state from `Depends(require_admin)` to `Depends(require_local_admin)`:
+
+| Route | Line | What it mutates |
+|-------|------|-----------------|
+| `auth_create_user` | 3123 | local user row (the chain's step 2) |
+| `auth_update_user` | 3154 | user role (privilege) |
+| `auth_delete_user` | 3139 | user row + cascade |
+| `twofa_admin_reset` | 3236 | another user's 2FA state |
+| `set_user_permissions` | 3356 | bucket grant row |
+| `delete_user_permission` | 3377 | bucket grant row |
+| `create_endpoint` | 4570 | endpoint row (encrypted server creds) |
+| `update_endpoint` | 4610 | endpoint row (encrypted server creds) |
+| `delete_endpoint` | 4632 | endpoint row |
+| `create_token` | 3420 | API token row — **refactor**: drop the inline `s3:` check at 3422, switch the route to `require_local_admin` for consistency |
+
+Routes that stay on `require_admin` (they operate on S3 state via the user's IAM scope — that's the entire point of `AUTH_MODE=s3`):
+
+- All bucket routes (`create_bucket`, `delete_bucket`, versioning, lifecycle, CORS, policy, ACL, tagging, multipart, copy/rename, crawl)
+- All object routes (`delete_objects`, `delete_folder`, `create_folder`, `purge_versions`, `version_*`)
+- Read-only admin routes (`auth_list_users`, `get_user_permissions`, `list_tokens`, `list_endpoints`, `s3_health_*`, `health_detail`, `audit_log`) — these don't enable persistence; deeper tightening is a follow-up.
+
+**Out of scope (flagged in §8 risk #6 above):** gating `auth_login` on `AUTH_MODE != "s3"` and/or skipping default-admin seeding in S3 mode. Both are deeper structural changes that may break operator workflows (emergency local access); the chokepoint above is sufficient to close the exploit without touching them.
+
+**Files:** `backend/main.py` (one new ~10-line dependency, ten `Depends(...)` swaps, one inline check deleted at 3422), `backend/test_main.py` (positive + negative tests per swapped route).
+
+### 9.3 A9 — Federated user enumeration via uncaught `bcrypt.verify` `ValueError` (MEDIUM, conf 9)
+
+**The bug.** Federated users (LDAP/OAuth/OIDC) created by `_sync_federated_user` (`main.py:836`) store an **unusable** placeholder password hash of the form `LDAP:<hex>` / `OAUTH:<hex>` / `OIDC:<hex>` (`main.py:873`). passlib's `bcrypt.verify(pw, hash)` raises `ValueError: not a valid bcrypt hash` for any non-bcrypt input — verified:
+
+```
+$ python3 -c "from passlib.hash import bcrypt; bcrypt.verify('test', 'LDAP:abc123')"
+ValueError: not a valid bcrypt hash
+```
+
+The verify calls are not wrapped, so FastAPI returns **500** for federated usernames and **401** for non-existent / local usernames. That oracle fingerprints both existence and which IdP the user authenticates against — exactly the targeting data an attacker needs for phishing.
+
+**Three affected sites:**
+
+| Route | Line | Reach | Current behavior |
+|-------|------|-------|------------------|
+| `auth_login` | 2971 | unauthenticated | 500 on federated username → enumeration oracle |
+| `twofa_disable` | 3225-3227 | self (auth'd) | has the `("LDAP:", "OAUTH:")` prefix-skip but **omits `"OIDC:"`** → 500 on OIDC users |
+| `auth_change_password` | 3395 | self (auth'd) | same unwrapped pattern |
+
+**Fix — defensive wrap returning 401 (matches the "Invalid username or password" branch):**
+
+```python
+# auth_login (main.py:2971)
+if not row:
+    raise HTTPException(401, "Invalid username or password")
+try:
+    pw_ok = bcrypt.verify(req.password, row["password_hash"])
+except (ValueError, TypeError):
+    pw_ok = False  # federated placeholder hash — same response as bad password
+if not pw_ok:
+    raise HTTPException(401, "Invalid username or password")
+```
+
+Plus:
+- `twofa_disable` (`main.py:3225`): add `"OIDC:"` to the prefix tuple (`("LDAP:", "OAUTH:", "OIDC:")`) so the existing skip works for all three providers, AND wrap the `bcrypt.verify` defensively for forward safety (a future `auth_source` value would otherwise reintroduce the crash).
+- `auth_change_password` (`main.py:3395`): same try/except wrap → 401 on malformed hash.
+
+**Files:** `backend/main.py` (~2971, ~3225, ~3395), `backend/test_main.py` (one test per site: federated username + any password → 401, not 500).
+
+### 9.4 Branch & PR strategy
+
+| PR | Branch (from `upstream-main`) | Contents |
+|----|-------------------------------|----------|
+| 4  | `fix/s3-mode-priv-esc-bypass` | A8 (`require_local_admin` chokepoint + 10 route swaps) **and** A9 (bcrypt wrap at 3 sites + `OIDC:` prefix) **and** the §9.7 test-isolation cherry-pick. All three are small, backend-only, and ride together so a reviewer can validate the security changes without the cross-run flake noise. |
+
+Branch from `upstream-main` (clean), never from `main`. Docs (this section) live only on `main`. Before opening PR 4 verify `git diff upstream-main...fix/s3-mode-priv-esc-bypass` contains **no** `docs/`, `AGENTS.md`, or `*.md` changes.
+
+PR 2 (`fix/mcp-per-request-auth`, A7 with the §4 augmentation above) proceeds independently — it touches only `mcp/` and is unchanged by A8/A9.
+
+### 9.5 Implementation sequence (for project-manager)
+
+Ordered by dependency. Each item maps to one atomic commit.
+
+1. **Branch setup:** refresh `upstream-main` (`git fetch upstream && git branch -f upstream-main upstream/main`); cut `fix/s3-mode-priv-esc-bypass` from it.
+2. **A8 chokepoint** (highest leverage, smallest change): add `require_local_admin` below `require_admin`; swap the 10 routes in §9.2's table; delete the now-redundant inline check at `main.py:3422`. Run `pytest backend/` — existing tests should still pass (they use local/LDAP/OAuth/OIDC auth, not S3 sessions).
+3. **A8 negative tests:** for each swapped route, add a test that creates an S3-mode session (cookie with `sub:"s3:..."`) and asserts 403. Extend the existing `TestS3TokenPrivilegeEscalation` class in `backend/test_main.py:1361-1440`.
+4. **A9 fix:** wrap `bcrypt.verify` at the three sites; add `"OIDC:"` to the `twofa_disable` prefix tuple.
+5. **A9 tests:** one positive test per site — login as a federated user (any password) → 401, not 500; `twofa_disable` for an OIDC user → succeeds (skip path) instead of 500; `auth_change_password` for a federated user → 401.
+6. **§9.7 test-isolation cherry-pick** (see below): cherry-pick `539f6c7` onto this branch; apply the two belt-and-suspenders test edits. Run `pytest backend/` repeatedly (≥3×) to confirm zero flakes.
+7. **Backend test pass → open PR 4.**
+
+Estimated effort: 1–2 hours code + tests, plus review.
+
+### 9.6 Testing strategy
+
+- **A8:** for every route swapped to `require_local_admin`, an S3-mode session (cookie JWT `sub:"s3:AKIA..."`) gets 403; a local/LDAP/OAuth/OIDC admin gets the normal 2xx/4xx response. The full chain in §9.2 must fail at step 2 (`auth_create_user`) — add an end-to-end regression test asserting the chain is broken.
+- **A9:** `auth_login` with username `"oidc-user"` (placeholder hash `"OIDC:abc"`) returns 401 for any password, not 500. Same for `"ldap-user"` and `"oauth-user"`. `twofa_disable` for an OIDC user with `password=""` succeeds (skip path). Verify the timing oracle is closed (responses are byte-identical 401s — manual check, not a hard test requirement).
+
+### 9.7 Test-isolation fix (cherry-pick `539f6c7` into PR 4)
+
+**Why this is in scope.** While validating PR 4 the PM noticed a "test-scaling flake" — `test_scaling.py::TestPrefixChildrenRebuild::test_root_level_files_excluded` and `test_scaling.py::TestFullIntegration::test_storage_history_uses_latest_not_max` failed on the 2nd consecutive `pytest backend/` run. The user authorized fixing it even if the cause originated upstream.
+
+**Root cause (fully root-caused, not probabilistic — confidence 10/10):**
+
+1. **`DB_DIR` `setdefault` race.** `backend/test_main.py:28` does `os.environ.setdefault("DB_DIR", "/tmp/sairo-test")` and `backend/test_scaling.py:25-26` does `os.environ.setdefault("DB_DIR", <tempfile.mkdtemp>)`. `main.py:322` reads `DB_DIR` exactly once at import. Pytest collects alphabetically by default (`test_main` < `test_scaling`, no `pytest-randomly`, no `pyproject.toml`/`pytest.ini` to change order), so `test_main.py` wins the race → `DB_DIR=/tmp/sairo-test` (persistent) for the whole session. `test_scaling.py`'s `setdefault` is a no-op.
+2. **Two non-idempotent `INSERT`s in `test_scaling.py`.** `_init_db()` uses `CREATE TABLE IF NOT EXISTS` (so existing rows survive a 2nd run). Most tests use `INSERT OR REPLACE` (idempotent on PK), but two use plain `INSERT`:
+   - `test_scaling.py:429-440` — `INSERT INTO objects` with deterministic keys `root_file_0.txt`…`root_file_9.txt` → `sqlite3.IntegrityError: UNIQUE constraint failed: objects.key` on run 2.
+   - `test_scaling.py:647, 652` — `INSERT INTO storage_history` (no PK) → rows accumulate forever → `assert len(apr12) == 1` fails with `2 == 1` on run 2.
+
+**Reproduction (deterministic, 100%):**
+```bash
+cd backend
+rm -rf /tmp/sairo-test && pytest .           # Run 1: 115 passed
+pytest .                                      # Run 2: 2 failed, 113 passed
+```
+Does NOT reproduce when `test_scaling.py` runs alone (its `setdefault` wins and it gets a fresh tempdir).
+
+**Prior art — `539f6c7` (`fix/test-isolation-conftest`, already on fork `main` as `ff188e2`):** adds `backend/conftest.py` (23 lines) that wipes `/tmp/sairo-test/` at session start:
+```python
+import os, shutil
+_TEST_DB_DIR = "/tmp/sairo-test"
+if os.environ.get("DB_DIR", _TEST_DB_DIR) == _TEST_DB_DIR:
+    shutil.rmtree(_TEST_DB_DIR, ignore_errors=True)
+os.makedirs(_TEST_DB_DIR, exist_ok=True)
+```
+Verified by the investigator: **5/5 consecutive full-suite runs pass (115/115 each)** with this conftest. Session-start scope is correct — function-scoped cleanup would break `test_main.py`'s module-scoped `app`/`client`/`admin_cookies`/`viewer_cookies` fixtures.
+
+**Upstream impact.** `git diff upstream/main HEAD -- backend/test_scaling.py` is empty (byte-identical) and `upstream/main` has no `backend/conftest.py`. The bug exists upstream and the fix should be sent there too — folding the cherry-pick into PR 4 achieves that.
+
+**Fix (two parts):**
+
+1. **Cherry-pick the existing conftest fix onto PR 4:**
+   ```bash
+   git cherry-pick 539f6c7
+   ```
+   This adds `backend/conftest.py` verbatim. Single commit, no source code changes. PR 4 reviewer sees three commits: A8, A9, test-isolation.
+
+2. **Belt-and-suspenders hardening of the two non-idempotent tests** (defense-in-depth so the flake cannot resurface if the conftest is ever removed):
+   - `backend/test_scaling.py:429, 437` — change `INSERT INTO objects` → `INSERT OR REPLACE INTO objects`.
+   - `backend/test_scaling.py:647, 652` — add `DELETE FROM storage_history` (or scope the assertion query to rows inserted this run via a per-run run_id column).
+
+**Out of scope (follow-up, not in PR 4):** the investigator noted that `test_scaling.py:25` calls `tempfile.mkdtemp(prefix="sairo-scaling-test-")` which is never cleaned up (118 orphaned dirs were found on the dev machine). A `tmp_path_factory`-based fixture or `atexit` cleanup would fix it but is not user-visible and not the cause of this flake.
+
+**Acceptance:**
+- `pytest backend/` passes 3/3 consecutive runs from a cold start.
+- `pytest backend/` passes 3/3 consecutive runs from a warm `/tmp/sairo-test/`.
+
+---
