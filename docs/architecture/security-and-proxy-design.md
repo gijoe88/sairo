@@ -145,7 +145,19 @@ GitHub branch domain check (`:3735`) is `if OAUTH_ALLOWED_DOMAINS and domain and
 6. Resources (`mcp/resources/providers.py`) currently can't see the session (no `Context`) and **perform no auth/authz of any kind** — they enumerate every per-bucket DB on disk and return bucket names / object counts / sizes / growth history. Two-layer fix: (a) apply the same Bearer middleware from fix #1 so unauthenticated clients can't reach them at all; (b) switch to FastMCP's context-aware resource handler form, thread the per-request identity, and enforce `require_bucket_read` per bucket inside each handler (for `storage_overview`, filter `bucket_dbs` through `session.can_read_bucket(bucket)` exactly as `tools/discovery.py:61-62` does). Until (b) lands, the minimum-risk mitigation is to disable both resources when the resolved session is non-admin.
 7. Fix the docs (`website/src/content/docs/features/mcp.mdx`) that falsely claim "every tool call is gated by authentication" and instruct operators to mint an **admin**-role token (should be least-privilege viewer by default) — but **docs go on fork `main`, not this PR branch**. Coordinate: code in PR 2, doc correction on `main`.
 
-**Risk flag (highest-risk item in the whole plan):** FastMCP's streamable-HTTP transport may not expose a clean middleware/seam; the PM must spike `mcp.streamable_http_app()` first. If FastMCP can't be secured at the transport level, the fallback is to run the MCP server behind a sidecar that injects auth, or to gate by `MCP_BIND_HOST=127.0.0.1` only + document that public exposure requires an auth-aware reverse proxy in front. This decision is **flagged for the user** because it shapes the MCP threat model.
+**Risk flag (resolved — implementation path confirmed):** FastMCP's `streamable_http_app() -> Starlette` is the intended seam (confirmed by reading `mcp/server/fastmcp/server.py` in MCP SDK v1.9.0). It returns a fully-wired Starlette app with the `/mcp` mount, custom routes, and session manager already in place. The clean integration path is to **bypass `mcp.run(transport="streamable-http")`** (which calls `streamable_http_app()` internally and runs uvicorn itself, leaving no seam to inject middleware) and instead in `mcp/server.py:main()`:
+
+```python
+# Build the Starlette app ourselves, attach the Bearer middleware, run uvicorn
+app = mcp.streamable_http_app()
+app.add_middleware(SairoBearerAuthMiddleware)   # new — validates per-request Bearer
+import uvicorn
+uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)
+```
+
+The SDK also has a first-class OAuth provider hook (`OAuthAuthorizationServerProvider` + `BearerAuthBackend` + `RequireAuthMiddleware`) at `mcp.server.auth.middleware.*`, but it's OAuth-shaped (token validation + scopes + client IDs) and overkill for Sairo's "validate a single static Bearer against the backend" model. A custom Starlette middleware is simpler and decouples us from SDK auth reshuffles.
+
+**Per-request session propagation:** tools already receive a FastMCP `Context` (see `_ctx_session(ctx)` usage in every `mcp/tools/*.py`). The context exposes `request_context.meta` and the underlying Starlette `Request` via `request_context.request`. The middleware should stash the validated `UserSession` in `request.state.sairo_session`; `_ctx_session(ctx)` then reads from there instead of the lifespan dict. Resources need to switch to the context-aware signature form (`def handler(ctx: Context)` instead of `def handler()`) — the SDK supports both.
 
 **Files:** `mcp/server.py`, `mcp/auth.py`, `mcp/tools/*.py`, `mcp/resources/providers.py`, `mcp/tests/`.
 
