@@ -2887,7 +2887,13 @@ def auth_login(req: LoginRequest, request: Request):
     with _get_users_db() as db:
         row = db.execute("SELECT username, password_hash, role, totp_enabled FROM users WHERE username=?",
                          (req.username,)).fetchone()
-    if not row or not bcrypt.verify(req.password, row["password_hash"]):
+    if not row:
+        raise HTTPException(401, "Invalid username or password")
+    try:
+        pw_ok = bcrypt.verify(req.password, row["password_hash"])
+    except (ValueError, TypeError):
+        pw_ok = False  # federated placeholder hash — same response as bad password
+    if not pw_ok:
         raise HTTPException(401, "Invalid username or password")
     # Check 2FA
     if row["totp_enabled"]:
@@ -3130,9 +3136,13 @@ def twofa_disable(req: TwoFactorDisableRequest, user: dict = Depends(get_current
         raise HTTPException(404, "User not found")
     if not row["totp_enabled"]:
         raise HTTPException(400, "2FA is not enabled")
-    # Verify password (skip for LDAP/OAuth users who have unusable passwords)
-    if not row["password_hash"].startswith(("LDAP:", "OAUTH:")):
-        if not bcrypt.verify(req.password, row["password_hash"]):
+    # Verify password (skip for LDAP/OAuth/OIDC users who have unusable passwords)
+    if not row["password_hash"].startswith(("LDAP:", "OAUTH:", "OIDC:")):
+        try:
+            pw_ok = bcrypt.verify(req.password, row["password_hash"])
+        except (ValueError, TypeError):
+            pw_ok = False  # malformed/non-bcrypt hash — treat as bad password
+        if not pw_ok:
             raise HTTPException(401, "Invalid password")
     with _get_users_db() as db:
         db.execute("UPDATE users SET totp_enabled=0, totp_secret=NULL, recovery_codes=NULL WHERE username=?",
@@ -3301,7 +3311,13 @@ def auth_change_password(req: ChangePasswordRequest, user: dict = Depends(get_cu
         raise HTTPException(400, "Password must be at least 8 characters")
     with _get_users_db() as db:
         row = db.execute("SELECT password_hash FROM users WHERE username=?", (user["username"],)).fetchone()
-        if not row or not bcrypt.verify(req.old_password, row["password_hash"]):
+        if not row:
+            raise HTTPException(401, "Current password is incorrect")
+        try:
+            pw_ok = bcrypt.verify(req.old_password, row["password_hash"])
+        except (ValueError, TypeError):
+            pw_ok = False  # federated placeholder hash — same response as bad password
+        if not pw_ok:
             raise HTTPException(401, "Current password is incorrect")
         db.execute("UPDATE users SET password_hash=? WHERE username=?",
                    (bcrypt.hash(req.new_password), user["username"]))

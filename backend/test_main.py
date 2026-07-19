@@ -1061,3 +1061,116 @@ class TestS3TokenPrivilegeEscalation:
         # the chokepoint did not 403 a local admin.
         assert resp.status_code in (200, 409), \
             f"local admin must reach the handler (200/409), got {resp.status_code}"
+
+
+# ── Federated user enumeration oracle — bcrypt.verify wrap (A9) ──────────
+
+class TestFederatedUserEnumeration:
+    """A9 (§9.3): federated users (LDAP/OAuth/OIDC) created by
+    _sync_federated_user store an unusable placeholder hash
+    ("LDAP:<hex>" / "OAUTH:<hex>" / "OIDC:<hex>"). passlib's bcrypt.verify
+    raises ValueError on these, so unwrapped call sites returned 500 for
+    existing federated usernames vs 401 for local/unknown names — an
+    existence + IdP oracle for phishing targeting.
+
+    Fix: wrap each verify defensively so federated hashes return the same
+    401 as a bad password, and add "OIDC:" to twofa_disable's prefix-skip
+    tuple (was missing, so OIDC users hit the verify and crashed)."""
+
+    def _reset_login_rate_limits(self, m):
+        """Clear in-memory rate-limit counters so test ordering can't trip 429."""
+        m._login_attempts.clear()
+        try:
+            m.limiter.reset()  # slowapi in-memory storage
+        except Exception:
+            pass
+
+    def _make_federated_user(self, m, username, source, hash_prefix,
+                             role="viewer", totp_enabled=False):
+        """Create a federated user via the production _sync_federated_user
+        chokepoint — i.e. exactly the row shape that triggers the bug
+        (password_hash = "<PREFIX>:<hex>", unusable by bcrypt.verify)."""
+        m._sync_federated_user(username, source, hash_prefix, role)
+        if totp_enabled:
+            # _sync_federated_user always creates with totp_enabled=0; flip it
+            # for tests that need an existing 2FA-enabled federated user.
+            with m._get_users_db() as db:
+                db.execute(
+                    "UPDATE users SET totp_enabled=1 WHERE username=?", (username,))
+                db.commit()
+
+    def _session_cookie(self, m, username, role="viewer"):
+        """Forge a signed session cookie — same shape auth_login mints."""
+        import jwt
+        token = jwt.encode(
+            {"sub": username, "role": role,
+             "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
+            m.JWT_SECRET, algorithm="HS256")
+        return {"access_token": token}
+
+    # ── Test 1: auth_login returns 401 (NOT 500) per federated prefix ───
+
+    @pytest.mark.parametrize("source,prefix", [
+        ("ldap", "LDAP"),
+        ("oauth", "OAUTH"),
+        ("oidc", "OIDC"),
+    ])
+    def test_auth_login_returns_401_not_500_for_federated_user(self, app, source, prefix):
+        """Each federated prefix must yield 401, never 500 — closing the
+        existence + IdP oracle. Before the fix, bcrypt.verify raised
+        ValueError on the placeholder hash and FastAPI returned 500 for
+        existing federated usernames."""
+        import secrets as _s
+        m = _main_module()
+        username = f"fed-{source}-{_s.token_hex(8)}"
+        self._make_federated_user(m, username, source, prefix)
+        self._reset_login_rate_limits(m)
+        with TestClient(app) as c:
+            resp = c.post("/api/auth/login",
+                          json={"username": username, "password": "anything"})
+        assert resp.status_code == 401, \
+            f"federated ({prefix}:) login must be 401, got {resp.status_code}"
+        assert resp.json()["detail"] == "Invalid username or password"
+
+    # ── Test 2: twofa_disable succeeds (skip path) for an OIDC user ─────
+
+    def test_twofa_disable_oidc_user_succeeds(self, app):
+        """OIDC was missing from twofa_disable's prefix-skip tuple, so the
+        verify crashed with 500. After the fix the skip path runs and 2FA
+        is disabled cleanly."""
+        import secrets as _s
+        m = _main_module()
+        username = f"fed-oidc-2fa-{_s.token_hex(8)}"
+        self._make_federated_user(m, username, "oidc", "OIDC", totp_enabled=True)
+        cookie = self._session_cookie(m, username)
+        with TestClient(app) as c:
+            resp = c.post("/api/auth/2fa/disable",
+                          json={"password": ""}, cookies=cookie)
+        assert resp.status_code == 200, \
+            f"OIDC user 2FA disable must succeed (skip path), got {resp.status_code}"
+        assert resp.json()["disabled"] is True
+        # Defense-in-depth: confirm the DB was actually updated.
+        with m._get_users_db() as db:
+            row = db.execute(
+                "SELECT totp_enabled FROM users WHERE username=?", (username,)
+            ).fetchone()
+        assert row and row["totp_enabled"] == 0, \
+            "totp_enabled must be flipped to 0 in the DB"
+
+    # ── Test 3: auth_change_password returns 401 (NOT 500) for federated ─
+
+    def test_change_password_returns_401_not_500_for_federated_user(self, app):
+        """A federated user changing their password must hit the wrapped
+        verify and get 401 — never a 500 leak. Before the fix: 500."""
+        import secrets as _s
+        m = _main_module()
+        username = f"fed-ldap-cp-{_s.token_hex(8)}"
+        self._make_federated_user(m, username, "ldap", "LDAP")
+        cookie = self._session_cookie(m, username)
+        with TestClient(app) as c:
+            resp = c.put("/api/auth/change-password",
+                         json={"old_password": "whatever", "new_password": "newpass123"},
+                         cookies=cookie)
+        assert resp.status_code == 401, \
+            f"federated change-password must be 401, got {resp.status_code}"
+        assert resp.json()["detail"] == "Current password is incorrect"
