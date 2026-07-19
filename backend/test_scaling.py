@@ -427,14 +427,14 @@ class TestPrefixChildrenRebuild:
             # Insert root-level files (prefix='')
             for i in range(10):
                 db.execute(
-                    "INSERT INTO objects (key,size,last_modified,etag,prefix,depth,crawl_gen) "
+                    "INSERT OR REPLACE INTO objects (key,size,last_modified,etag,prefix,depth,crawl_gen) "
                     "VALUES (?,?,?,?,?,?,?)",
                     (f"root_file_{i}.txt", 1024, "2026-04-01T00:00:00Z", f'"etag_{i}"', "", 0, 1),
                 )
             # Insert folder files
             for i in range(20):
                 db.execute(
-                    "INSERT INTO objects (key,size,last_modified,etag,prefix,depth,crawl_gen) "
+                    "INSERT OR REPLACE INTO objects (key,size,last_modified,etag,prefix,depth,crawl_gen) "
                     "VALUES (?,?,?,?,?,?,?)",
                     (f"data/file_{i}.csv", 2048, "2026-04-01T00:00:00Z", f'"etag_d{i}"', "data/", 1, 1),
                 )
@@ -641,6 +641,9 @@ class TestFullIntegration:
         _seed_bucket(bucket, 500)
 
         with _get_db(bucket) as db:
+            # Belt-and-suspenders: storage_history has no PK; clear rows from
+            # prior runs so this test is order-independent even without conftest.
+            db.execute("DELETE FROM storage_history")
             # Simulate two snapshots on the same day:
             # Snapshot 1: 500 objects, 1000000 bytes (the "peak")
             db.execute(

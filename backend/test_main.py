@@ -1767,3 +1767,294 @@ class TestRateLimiterResolvedKey:
             for k in added:
                 m._login_attempts.pop(k, None)
 
+
+# ── S3-mode privilege escalation — require_local_admin chokepoint (A8) ────
+
+class TestS3ModePrivEscBypassA8:
+    """A8 (§9.2): in AUTH_MODE=s3 every session JWT carries role:"admin"
+    (because the rest of the code uses role=="admin" as the sole capability
+    check, and auth_login_s3 mints admin for any key pair that passes
+    list_buckets). That role claim only reflects IAM capability — it MUST NOT
+    authorize changes to state outside the user's IAM scope (local users, API
+    tokens, endpoints, bucket grants, 2FA resets).
+
+    The fix is one structural chokepoint — require_local_admin — applied to
+    every admin mutation route that writes non-IAM-scoped state. These tests
+    forge an s3-mode session cookie and assert 403 on each swapped route.
+
+    Note: V4-specific coverage (create_token + Bearer refusal) lives in
+    TestS3TokenPrivilegeEscalation above. This class covers the nine additional
+    routes that the A3 fix missed."""
+
+    def _s3_cookie(self, m, sub="s3:testakid"):
+        """Forge a valid s3-mode session cookie (signed with JWT_SECRET, carrying
+        encrypted s3ak/s3sk) — same shape auth_login_s3 produces."""
+        import jwt
+        token = jwt.encode(
+            {"sub": sub, "role": "admin", "eid": "default",
+             "s3ak": m._encrypt("AKIAFAKEACCESSKEY123"),
+             "s3sk": m._encrypt("fakeSecretKey456"),
+             "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
+            m.JWT_SECRET, algorithm="HS256")
+        return {"access_token": token}
+
+    def _enable_s3(self, monkeypatch):
+        """Flip AUTH_MODE=s3 for the duration of one test."""
+        try:
+            import backend.main as m
+        except ModuleNotFoundError:
+            import main as m
+        monkeypatch.setattr(m, "AUTH_MODE", "s3")
+        return m
+
+    # ── one negative test per swapped route (9 routes — create_token is
+    #    covered by TestS3TokenPrivilegeEscalation.test_s3_user_cannot_create_api_token) ──
+
+    def test_s3_user_cannot_create_user(self, app, monkeypatch):
+        """POST /api/auth/users — auth_create_user (step 2 of the §9.2 chain)."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.post("/api/auth/users",
+                          json={"username": "backdoor", "password": "password123", "role": "admin"},
+                          cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not create local users, got {resp.status_code}"
+
+    def test_s3_user_cannot_delete_user(self, app, monkeypatch):
+        """DELETE /api/auth/users/{username} — auth_delete_user."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.delete("/api/auth/users/someuser", cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not delete local users, got {resp.status_code}"
+
+    def test_s3_user_cannot_update_user(self, app, monkeypatch):
+        """PUT /api/auth/users/{username} — auth_update_user (privilege)."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.put("/api/auth/users/someuser",
+                         json={"role": "viewer"},
+                         cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not change user roles, got {resp.status_code}"
+
+    def test_s3_user_cannot_reset_2fa(self, app, monkeypatch):
+        """POST /api/auth/2fa/reset/{username} — twofa_admin_reset."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.post("/api/auth/2fa/reset/someuser", cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not reset another user's 2FA, got {resp.status_code}"
+
+    def test_s3_user_cannot_set_permissions(self, app, monkeypatch):
+        """PUT /api/auth/users/{username}/permissions — set_user_permissions."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.put("/api/auth/users/someuser/permissions",
+                         json={"permissions": [{"bucket": "somebucket", "permission": "read"}]},
+                         cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not grant bucket permissions, got {resp.status_code}"
+
+    def test_s3_user_cannot_delete_permission(self, app, monkeypatch):
+        """DELETE /api/auth/users/{username}/permissions/{bucket} — delete_user_permission."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.delete("/api/auth/users/someuser/permissions/somebucket", cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not revoke bucket permissions, got {resp.status_code}"
+
+    def test_s3_user_cannot_create_endpoint(self, app, monkeypatch):
+        """POST /api/endpoints — create_endpoint (encrypted server creds)."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.post("/api/endpoints",
+                          json={"id": "testep1", "name": "test-endpoint",
+                                "endpoint_url": "http://example.com",
+                                "access_key": "ak", "secret_key": "sk"},
+                          cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not register endpoints, got {resp.status_code}"
+
+    def test_s3_user_cannot_update_endpoint(self, app, monkeypatch):
+        """PUT /api/endpoints/{endpoint_id} — update_endpoint."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.put("/api/endpoints/someep",
+                         json={"name": "renamed"},
+                         cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not edit endpoints, got {resp.status_code}"
+
+    def test_s3_user_cannot_delete_endpoint(self, app, monkeypatch):
+        """DELETE /api/endpoints/{endpoint_id} — delete_endpoint."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.delete("/api/endpoints/someep", cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not delete endpoints, got {resp.status_code}"
+
+    # ── end-to-end regression: the §9.2 chain must break at step 2 ────
+
+    def test_s3_mode_priv_esc_chain_blocked_at_create_user(self, app, monkeypatch):
+        """The full §9.2 chain starts with: forge an s3-mode admin cookie, then
+        POST /api/auth/users {"username":"backdoor","role":"admin"} to plant a
+        local admin row that has no s3: prefix (and so would pass the per-route
+        s3: guard on create_token that A3 added). The require_local_admin
+        chokepoint must break the chain here — 403, and the backdoor row must
+        NOT be inserted into the users table."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.post("/api/auth/users",
+                          json={"username": "backdoor", "password": "password123", "role": "admin"},
+                          cookies=cookie)
+        assert resp.status_code == 403, \
+            f"chain step 2 must be blocked, got {resp.status_code}"
+        # Defense-in-depth: confirm no row was persisted. (The dependency fires
+        # before the handler, so the INSERT never runs — but verify explicitly
+        # so a future regression that reorders the guard is caught loudly.)
+        with m._get_users_db() as db:
+            row = db.execute(
+                "SELECT username FROM users WHERE username=?", ("backdoor",)
+            ).fetchone()
+        assert row is None, "backdoor local-admin row must not exist"
+
+    # ── positive regression: local mode is unaffected ────────────────
+    # (test_local_admin_can_still_create_token_and_bearer_still_works is
+    #  covered by TestS3TokenPrivilegeEscalation above.)
+
+    def test_local_admin_can_still_create_user(self, client, admin_cookies):
+        """Positive regression: require_local_admin must not block a local admin
+        on auth_create_user (a swapped route) — covers one of the nine non-token
+        mutations that the existing positive test above doesn't touch."""
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": "local-created-by-admin", "password": "password123", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        # 200 (created) or 409 (already exists from a prior run) — either proves
+        # the chokepoint did not 403 a local admin.
+        assert resp.status_code in (200, 409), \
+            f"local admin must reach the handler (200/409), got {resp.status_code}"
+
+# ── Federated user enumeration oracle — bcrypt.verify wrap (A9) ──────────
+
+class TestFederatedUserEnumeration:
+    """A9 (§9.3): federated users (LDAP/OAuth/OIDC) created by
+    _sync_federated_user store an unusable placeholder hash
+    ("LDAP:<hex>" / "OAUTH:<hex>" / "OIDC:<hex>"). passlib's bcrypt.verify
+    raises ValueError on these, so unwrapped call sites returned 500 for
+    existing federated usernames vs 401 for local/unknown names — an
+    existence + IdP oracle for phishing targeting.
+
+    Fix: wrap each verify defensively so federated hashes return the same
+    401 as a bad password, and add "OIDC:" to twofa_disable's prefix-skip
+    tuple (was missing, so OIDC users hit the verify and crashed)."""
+
+    def _reset_login_rate_limits(self, m):
+        """Clear in-memory rate-limit counters so test ordering can't trip 429."""
+        m._login_attempts.clear()
+        try:
+            m.limiter.reset()  # slowapi in-memory storage
+        except Exception:
+            pass
+
+    def _make_federated_user(self, m, username, source, hash_prefix,
+                             role="viewer", totp_enabled=False):
+        """Create a federated user via the production _sync_federated_user
+        chokepoint — i.e. exactly the row shape that triggers the bug
+        (password_hash = "<PREFIX>:<hex>", unusable by bcrypt.verify)."""
+        m._sync_federated_user(username, source, hash_prefix, role)
+        if totp_enabled:
+            # _sync_federated_user always creates with totp_enabled=0; flip it
+            # for tests that need an existing 2FA-enabled federated user.
+            with m._get_users_db() as db:
+                db.execute(
+                    "UPDATE users SET totp_enabled=1 WHERE username=?", (username,))
+                db.commit()
+
+    def _session_cookie(self, m, username, role="viewer"):
+        """Forge a signed session cookie — same shape auth_login mints."""
+        import jwt
+        token = jwt.encode(
+            {"sub": username, "role": role,
+             "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
+            m.JWT_SECRET, algorithm="HS256")
+        return {"access_token": token}
+
+    # ── Test 1: auth_login returns 401 (NOT 500) per federated prefix ───
+
+    @pytest.mark.parametrize("source,prefix", [
+        ("ldap", "LDAP"),
+        ("oauth", "OAUTH"),
+        ("oidc", "OIDC"),
+    ])
+    def test_auth_login_returns_401_not_500_for_federated_user(self, app, source, prefix):
+        """Each federated prefix must yield 401, never 500 — closing the
+        existence + IdP oracle. Before the fix, bcrypt.verify raised
+        ValueError on the placeholder hash and FastAPI returned 500 for
+        existing federated usernames."""
+        import secrets as _s
+        m = _main_module()
+        username = f"fed-{source}-{_s.token_hex(8)}"
+        self._make_federated_user(m, username, source, prefix)
+        self._reset_login_rate_limits(m)
+        with TestClient(app) as c:
+            resp = c.post("/api/auth/login",
+                          json={"username": username, "password": "anything"})
+        assert resp.status_code == 401, \
+            f"federated ({prefix}:) login must be 401, got {resp.status_code}"
+        assert resp.json()["detail"] == "Invalid username or password"
+
+    # ── Test 2: twofa_disable succeeds (skip path) for an OIDC user ─────
+
+    def test_twofa_disable_oidc_user_succeeds(self, app):
+        """OIDC was missing from twofa_disable's prefix-skip tuple, so the
+        verify crashed with 500. After the fix the skip path runs and 2FA
+        is disabled cleanly."""
+        import secrets as _s
+        m = _main_module()
+        username = f"fed-oidc-2fa-{_s.token_hex(8)}"
+        self._make_federated_user(m, username, "oidc", "OIDC", totp_enabled=True)
+        cookie = self._session_cookie(m, username)
+        with TestClient(app) as c:
+            resp = c.post("/api/auth/2fa/disable",
+                          json={"password": ""}, cookies=cookie)
+        assert resp.status_code == 200, \
+            f"OIDC user 2FA disable must succeed (skip path), got {resp.status_code}"
+        assert resp.json()["disabled"] is True
+        # Defense-in-depth: confirm the DB was actually updated.
+        with m._get_users_db() as db:
+            row = db.execute(
+                "SELECT totp_enabled FROM users WHERE username=?", (username,)
+            ).fetchone()
+        assert row and row["totp_enabled"] == 0, \
+            "totp_enabled must be flipped to 0 in the DB"
+
+    # ── Test 3: auth_change_password returns 401 (NOT 500) for federated ─
+
+    def test_change_password_returns_401_not_500_for_federated_user(self, app):
+        """A federated user changing their password must hit the wrapped
+        verify and get 401 — never a 500 leak. Before the fix: 500."""
+        import secrets as _s
+        m = _main_module()
+        username = f"fed-ldap-cp-{_s.token_hex(8)}"
+        self._make_federated_user(m, username, "ldap", "LDAP")
+        cookie = self._session_cookie(m, username)
+        with TestClient(app) as c:
+            resp = c.put("/api/auth/change-password",
+                         json={"old_password": "whatever", "new_password": "newpass123"},
+                         cookies=cookie)
+        assert resp.status_code == 401, \
+            f"federated change-password must be 401, got {resp.status_code}"
+        assert resp.json()["detail"] == "Current password is incorrect"
