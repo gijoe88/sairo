@@ -857,3 +857,207 @@ class TestCompatPermissions:
                          "/api/presigned-url?key=test", "/api/multipart-uploads"]:
                 resp = fresh.get(path)
                 assert resp.status_code == 401, f"{path} should require auth, got {resp.status_code}"
+
+
+# ── S3-mode privilege escalation — require_local_admin chokepoint (A8) ────
+
+class TestS3TokenPrivilegeEscalation:
+    """A8 (§9.2): in AUTH_MODE=s3 every session JWT carries role:"admin"
+    (because the rest of the code uses role=="admin" as the sole capability
+    check, and auth_login_s3 mints admin for any key pair that passes
+    list_buckets). That role claim only reflects IAM capability — it MUST NOT
+    authorize changes to state outside the user's IAM scope (local users, API
+    tokens, endpoints, bucket grants, 2FA resets).
+
+    The fix is one structural chokepoint — require_local_admin — applied to
+    every admin mutation route that writes non-IAM-scoped state. These tests
+    forge an s3-mode session cookie and assert 403 on each swapped route."""
+
+    def _s3_cookie(self, m, sub="s3:testakid"):
+        """Forge a valid s3-mode session cookie (signed with JWT_SECRET, carrying
+        encrypted s3ak/s3sk) — same shape auth_login_s3 produces."""
+        import jwt
+        token = jwt.encode(
+            {"sub": sub, "role": "admin", "eid": "default",
+             "s3ak": m._encrypt("AKIAFAKEACCESSKEY123"),
+             "s3sk": m._encrypt("fakeSecretKey456"),
+             "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
+            m.JWT_SECRET, algorithm="HS256")
+        return {"access_token": token}
+
+    def _enable_s3(self, monkeypatch):
+        """Flip AUTH_MODE=s3 for the duration of one test."""
+        try:
+            import backend.main as m
+        except ModuleNotFoundError:
+            import main as m
+        monkeypatch.setattr(m, "AUTH_MODE", "s3")
+        return m
+
+    # ── one negative test per swapped route (10 total) ───────────────
+
+    def test_s3_user_cannot_create_api_token(self, app, monkeypatch):
+        """POST /api/auth/tokens — create_token."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.post("/api/auth/tokens",
+                          json={"name": "x", "role": "viewer"},
+                          cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not mint API tokens, got {resp.status_code}"
+
+    def test_s3_user_cannot_create_user(self, app, monkeypatch):
+        """POST /api/auth/users — auth_create_user (step 2 of the §9.2 chain)."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.post("/api/auth/users",
+                          json={"username": "backdoor", "password": "password123", "role": "admin"},
+                          cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not create local users, got {resp.status_code}"
+
+    def test_s3_user_cannot_delete_user(self, app, monkeypatch):
+        """DELETE /api/auth/users/{username} — auth_delete_user."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.delete("/api/auth/users/someuser", cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not delete local users, got {resp.status_code}"
+
+    def test_s3_user_cannot_update_user(self, app, monkeypatch):
+        """PUT /api/auth/users/{username} — auth_update_user (privilege)."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.put("/api/auth/users/someuser",
+                         json={"role": "viewer"},
+                         cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not change user roles, got {resp.status_code}"
+
+    def test_s3_user_cannot_reset_2fa(self, app, monkeypatch):
+        """POST /api/auth/2fa/reset/{username} — twofa_admin_reset."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.post("/api/auth/2fa/reset/someuser", cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not reset another user's 2FA, got {resp.status_code}"
+
+    def test_s3_user_cannot_set_permissions(self, app, monkeypatch):
+        """PUT /api/auth/users/{username}/permissions — set_user_permissions."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.put("/api/auth/users/someuser/permissions",
+                         json={"permissions": [{"bucket": "somebucket", "permission": "read"}]},
+                         cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not grant bucket permissions, got {resp.status_code}"
+
+    def test_s3_user_cannot_delete_permission(self, app, monkeypatch):
+        """DELETE /api/auth/users/{username}/permissions/{bucket} — delete_user_permission."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.delete("/api/auth/users/someuser/permissions/somebucket", cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not revoke bucket permissions, got {resp.status_code}"
+
+    def test_s3_user_cannot_create_endpoint(self, app, monkeypatch):
+        """POST /api/endpoints — create_endpoint (encrypted server creds)."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.post("/api/endpoints",
+                          json={"id": "testep1", "name": "test-endpoint",
+                                "endpoint_url": "http://example.com",
+                                "access_key": "ak", "secret_key": "sk"},
+                          cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not register endpoints, got {resp.status_code}"
+
+    def test_s3_user_cannot_update_endpoint(self, app, monkeypatch):
+        """PUT /api/endpoints/{endpoint_id} — update_endpoint."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.put("/api/endpoints/someep",
+                         json={"name": "renamed"},
+                         cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not edit endpoints, got {resp.status_code}"
+
+    def test_s3_user_cannot_delete_endpoint(self, app, monkeypatch):
+        """DELETE /api/endpoints/{endpoint_id} — delete_endpoint."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.delete("/api/endpoints/someep", cookies=cookie)
+        assert resp.status_code == 403, \
+            f"s3-mode session must not delete endpoints, got {resp.status_code}"
+
+    # ── end-to-end regression: the §9.2 chain must break at step 2 ────
+
+    def test_s3_mode_priv_esc_chain_blocked_at_create_user(self, app, monkeypatch):
+        """The full §9.2 chain starts with: forge an s3-mode admin cookie, then
+        POST /api/auth/users {"username":"backdoor","role":"admin"} to plant a
+        local admin row that has no s3: prefix (and so would pass the per-route
+        s3: guard on create_token that A3 added). The require_local_admin
+        chokepoint must break the chain here — 403, and the backdoor row must
+        NOT be inserted into the users table."""
+        m = self._enable_s3(monkeypatch)
+        cookie = self._s3_cookie(m)
+        with TestClient(app) as c:
+            resp = c.post("/api/auth/users",
+                          json={"username": "backdoor", "password": "password123", "role": "admin"},
+                          cookies=cookie)
+        assert resp.status_code == 403, \
+            f"chain step 2 must be blocked, got {resp.status_code}"
+        # Defense-in-depth: confirm no row was persisted. (The dependency fires
+        # before the handler, so the INSERT never runs — but verify explicitly
+        # so a future regression that reorders the guard is caught loudly.)
+        with m._get_users_db() as db:
+            row = db.execute(
+                "SELECT username FROM users WHERE username=?", ("backdoor",)
+            ).fetchone()
+        assert row is None, "backdoor local-admin row must not exist"
+
+    # ── positive regression: local mode is unaffected ────────────────
+
+    def test_local_admin_can_still_create_token_and_bearer_still_works(self, client, admin_cookies):
+        """Positive regression: in AUTH_MODE=local (default, NOT flipped),
+        require_local_admin must let a real local admin through, the token
+        mint succeeds, and Bearer auth with the new token still works. Guards
+        against the chokepoint over-reaching into non-s3 modes."""
+        resp = client.post(
+            "/api/auth/tokens",
+            json={"name": "local-still-works", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        raw_token = resp.json()["token"]
+        assert raw_token.startswith("sairo_")
+
+        resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["username"] == "admin"
+        assert data["role"] == "viewer"
+
+    def test_local_admin_can_still_create_user(self, client, admin_cookies):
+        """Positive regression: require_local_admin must not block a local admin
+        on auth_create_user (a swapped route) — covers one of the nine non-token
+        mutations that the existing positive test above doesn't touch."""
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": "local-created-by-admin", "password": "password123", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        # 200 (created) or 409 (already exists from a prior run) — either proves
+        # the chokepoint did not 403 a local admin.
+        assert resp.status_code in (200, 409), \
+            f"local admin must reach the handler (200/409), got {resp.status_code}"

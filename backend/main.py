@@ -749,6 +749,18 @@ def require_admin(request: Request, user: dict = Depends(get_current_user)):
         return user
     raise HTTPException(403, "Admin access required")
 
+def require_local_admin(request: Request, user: dict = Depends(require_admin)):
+    """Admin routes that mutate non-IAM-scoped state. In AUTH_MODE=s3, the
+    session's role:"admin" only reflects IAM capability — it MUST NOT
+    authorize changes to state outside the user's IAM scope."""
+    if AUTH_MODE == "s3" and user["username"].startswith("s3:"):
+        raise HTTPException(
+            403,
+            "S3-mode sessions cannot perform this action; "
+            "ask an admin with local/LDAP/OAuth/OIDC credentials.",
+        )
+    return user
+
 
 class FederatedAuthError(Exception):
     """Raised when a federated (SSO) login can't be completed safely."""
@@ -3019,7 +3031,7 @@ def auth_list_users(user: dict = Depends(require_admin)):
     return {"users": users}
 
 @app.post("/api/auth/users")
-def auth_create_user(req: CreateUserRequest, user: dict = Depends(require_admin)):
+def auth_create_user(req: CreateUserRequest, user: dict = Depends(require_local_admin)):
     if req.role not in ("admin", "viewer"):
         raise HTTPException(400, "Role must be 'admin' or 'viewer'")
     if len(req.password) < 8:
@@ -3035,7 +3047,7 @@ def auth_create_user(req: CreateUserRequest, user: dict = Depends(require_admin)
     return {"created": req.username, "role": req.role}
 
 @app.delete("/api/auth/users/{username}")
-def auth_delete_user(username: str, user: dict = Depends(require_admin)):
+def auth_delete_user(username: str, user: dict = Depends(require_local_admin)):
     if username == user["username"]:
         raise HTTPException(400, "Cannot delete your own account")
     with _get_users_db() as db:
@@ -3049,7 +3061,7 @@ def auth_delete_user(username: str, user: dict = Depends(require_admin)):
     return {"deleted": username}
 
 @app.put("/api/auth/users/{username}")
-def auth_update_user(username: str, req: UpdateUserRequest, user: dict = Depends(require_admin)):
+def auth_update_user(username: str, req: UpdateUserRequest, user: dict = Depends(require_local_admin)):
     if req.role not in ("admin", "viewer"):
         raise HTTPException(400, "Role must be 'admin' or 'viewer'")
     if username == user["username"]:
@@ -3130,7 +3142,7 @@ def twofa_disable(req: TwoFactorDisableRequest, user: dict = Depends(get_current
     return {"disabled": True}
 
 @app.post("/api/auth/2fa/reset/{username}")
-def twofa_admin_reset(username: str, user: dict = Depends(require_admin)):
+def twofa_admin_reset(username: str, user: dict = Depends(require_local_admin)):
     """Admin resets another user's 2FA."""
     if username == user["username"]:
         raise HTTPException(400, "Use /api/auth/2fa/disable instead")
@@ -3250,7 +3262,7 @@ def get_user_permissions(username: str, user: dict = Depends(require_admin)):
     return {"username": username, "permissions": [dict(r) for r in rows]}
 
 @app.put("/api/auth/users/{username}/permissions")
-def set_user_permissions(username: str, req: SetPermissionsRequest, user: dict = Depends(require_admin)):
+def set_user_permissions(username: str, req: SetPermissionsRequest, user: dict = Depends(require_local_admin)):
     for p in req.permissions:
         if p.permission not in ("read", "write"):
             raise HTTPException(400, f"Permission must be 'read' or 'write', got '{p.permission}'")
@@ -3271,7 +3283,7 @@ def set_user_permissions(username: str, req: SetPermissionsRequest, user: dict =
     return {"username": username, "updated": len(req.permissions)}
 
 @app.delete("/api/auth/users/{username}/permissions/{bucket}")
-def delete_user_permission(username: str, bucket: str, user: dict = Depends(require_admin)):
+def delete_user_permission(username: str, bucket: str, user: dict = Depends(require_local_admin)):
     with _get_users_db() as db:
         existing = db.execute("SELECT username FROM users WHERE username=?", (username,)).fetchone()
         if not existing:
@@ -3314,7 +3326,7 @@ def list_tokens(user: dict = Depends(require_admin)):
     return {"tokens": [dict(r) for r in rows]}
 
 @app.post("/api/auth/tokens")
-def create_token(req: CreateTokenRequest, user: dict = Depends(require_admin)):
+def create_token(req: CreateTokenRequest, user: dict = Depends(require_local_admin)):
     import hashlib
     if req.role not in ("admin", "viewer"):
         raise HTTPException(400, "Role must be 'admin' or 'viewer'")
@@ -4367,7 +4379,7 @@ def list_endpoints(user: dict = Depends(require_admin)):
     return {"endpoints": eps}
 
 @app.post("/api/endpoints")
-def create_endpoint(req: EndpointCreateRequest, user: dict = Depends(require_admin)):
+def create_endpoint(req: EndpointCreateRequest, user: dict = Depends(require_local_admin)):
     """Add a new S3 endpoint. Tests connectivity before saving."""
     if not req.id or not req.id.replace("-", "").replace("_", "").isalnum():
         raise HTTPException(400, "ID must be alphanumeric (dashes/underscores ok)")
@@ -4407,7 +4419,7 @@ def create_endpoint(req: EndpointCreateRequest, user: dict = Depends(require_adm
     return {"created": req.id}
 
 @app.put("/api/endpoints/{endpoint_id}")
-def update_endpoint(endpoint_id: str, req: EndpointUpdateRequest, user: dict = Depends(require_admin)):
+def update_endpoint(endpoint_id: str, req: EndpointUpdateRequest, user: dict = Depends(require_local_admin)):
     """Update an S3 endpoint."""
     with _get_users_db() as db:
         existing = db.execute("SELECT * FROM s3_endpoints WHERE id=?", (endpoint_id,)).fetchone()
@@ -4429,7 +4441,7 @@ def update_endpoint(endpoint_id: str, req: EndpointUpdateRequest, user: dict = D
     return {"updated": endpoint_id}
 
 @app.delete("/api/endpoints/{endpoint_id}")
-def delete_endpoint(endpoint_id: str, user: dict = Depends(require_admin)):
+def delete_endpoint(endpoint_id: str, user: dict = Depends(require_local_admin)):
     """Delete an S3 endpoint (cannot delete default)."""
     if endpoint_id == "default":
         raise HTTPException(400, "Cannot delete the default endpoint")
