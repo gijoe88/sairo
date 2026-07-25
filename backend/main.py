@@ -14,11 +14,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-import struct
-
 import boto3
 import jwt
-import pyarrow.parquet as pq
 import pyarrow.orc as orc_mod
 import fastavro
 from botocore.config import Config
@@ -38,6 +35,14 @@ from slowapi.errors import RateLimitExceeded
 from pricing import (
     get_storage_pricing, get_storage_price, estimate_monthly_cost as _estimate_monthly_cost,
     detect_provider, get_all_providers, calculate_savings, STATIC_PRICING,
+)
+from parquet_reader import (
+    read_footer as _read_parquet_footer,
+    read_parquet_rows as _read_parquet_rows,
+    stream_object as _stream_object,
+    PARQUET_PREVIEW_SMALL_FILE,
+    PARQUET_ROW_LIMIT_MAX,
+    PARQUET_STREAM_CAP,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -5323,11 +5328,41 @@ def download_object(bucket: str, key: str, user: dict = Depends(get_current_user
 # ── Rate limiting for CPU/memory intensive endpoints ───────────────────────
 _metadata_semaphore = threading.Semaphore(4)  # max 4 concurrent metadata/preview operations
 
+# Parquet row-preview caps (Tier 1). Defined in parquet_reader.py so the pure
+# read helper and these Query validators share a single source of truth.
+#   PARQUET_PREVIEW_SMALL_FILE — files ≤ this are read in full (worst case
+#       4 × 32 MB ≈ 128 MB resident across the semaphore slots above).
+#   PARQUET_ROW_LIMIT_MAX      — hard clamp on rows decoded per request.
+#   PARQUET_STREAM_CAP         — Tier 2 same-origin proxy hard size cap; above
+#       this the SQL tab is hidden and the stream endpoint returns 413.
+assert PARQUET_PREVIEW_SMALL_FILE == 32 * 1024 * 1024
+assert PARQUET_ROW_LIMIT_MAX == 1000
+assert PARQUET_STREAM_CAP == 128 * 1024 * 1024
+
 
 def _acquire_metadata_slot():
     """Acquire a metadata processing slot or raise 429."""
     if not _metadata_semaphore.acquire(timeout=5):
         raise HTTPException(429, "Too many concurrent metadata requests, try again shortly")
+
+
+# Dedicated gate for the Tier 2 ``parquet-stream`` proxy. Sized at 2, NOT the
+# metadata gate: streaming is duration-bound I/O (a ≤128MB download can hold a
+# slot for seconds-to-minutes) whereas ``_metadata_semaphore`` is sized for
+# resident memory (4 × 32MB pyarrow decode). Holding a metadata slot for a
+# whole download would let a SQL-tab user 429-starve the Tier 1 core path
+# (``parquet-rows`` / ``file-metadata`` / ``preview``) for the download window
+# and burn Starlette threadpool workers. ``iter_chunks(64KB)`` keeps only
+# ~64KB × concurrency resident regardless of the 128MB cap, so a separate
+# duration-bound gate is the correct model. Worst case 2 × 128MB throughput is
+# trivial. This divergence from arch §2 constraint #5 is documented there.
+_stream_semaphore = threading.Semaphore(2)  # max 2 concurrent parquet-stream downloads
+
+
+def _acquire_stream_slot():
+    """Acquire a stream download slot or raise 429."""
+    if not _stream_semaphore.acquire(timeout=5):
+        raise HTTPException(429, "Too many concurrent stream requests, try again shortly")
 
 
 @app.get("/api/buckets/{bucket}/preview")
@@ -5413,52 +5448,12 @@ def _file_metadata_inner(bucket, key):
 
 def _read_parquet_metadata(bucket: str, key: str, file_size: int):
     """Read Parquet footer to extract schema and row count without downloading the whole file."""
-    # Parquet footer: last 8 bytes = 4-byte footer length + 4-byte magic "PAR1"
-    # Then read the footer itself from (file_size - 8 - footer_length) to (file_size - 8)
-    if file_size < 12:
-        raise HTTPException(400, "File too small to be a valid Parquet file")
-
-    # Read the last 8 bytes to get footer length
-    tail_resp = s3.get_object(Bucket=bucket, Key=key, Range=f"bytes={file_size - 8}-{file_size - 1}")
-    tail = tail_resp["Body"].read()
-    if tail[4:8] != b"PAR1":
-        raise HTTPException(400, "Not a valid Parquet file (missing PAR1 magic)")
-    footer_len = struct.unpack("<I", tail[0:4])[0]
-
-    # Sanity check: footer shouldn't exceed 256MB
-    if footer_len > 256 * 1024 * 1024:
-        raise HTTPException(400, f"Parquet footer too large ({footer_len} bytes), likely corrupted")
-
-    # Read footer + magic for pyarrow
-    footer_start = file_size - 8 - footer_len
-    if footer_start < 4:
-        raise HTTPException(400, "Invalid Parquet footer length")
-    range_resp = s3.get_object(Bucket=bucket, Key=key, Range=f"bytes={footer_start}-{file_size - 1}")
-    footer_bytes = range_resp["Body"].read()
-
-    # Also need the first 4 bytes (PAR1 magic) for a valid parquet buffer
-    header_resp = s3.get_object(Bucket=bucket, Key=key, Range="bytes=0-3")
-    header_bytes = header_resp["Body"].read()
-    if header_bytes != b"PAR1":
-        raise HTTPException(400, "Not a valid Parquet file (missing header magic)")
-
-    # Build a minimal buffer: header (4) + padding + footer
-    # Cap padding to avoid OOM on large files (pyarrow only needs offsets to match)
-    MAX_PADDING = 1 * 1024 * 1024  # 1MB max padding
-    padding_size = footer_start - 4
-    if padding_size > MAX_PADDING:
-        # Use a sparse approach: seek instead of allocating giant buffer
-        buf = io.BytesIO()
-        buf.write(header_bytes)
-        buf.seek(footer_start)
-        buf.write(footer_bytes)
-        buf.seek(0)
-    else:
-        buf = io.BytesIO(header_bytes + b"\x00" * padding_size + footer_bytes)
-    try:
-        meta = pq.read_metadata(buf)
-    except Exception as e:
-        raise HTTPException(400, f"Failed to read Parquet metadata: {e}")
+    # Footer byte-range / magic-check / sparse-buffer assembly lives in the pure
+    # `parquet_reader` module so it can be shared and unit-tested. We pass the
+    # already-resolved ``file_size`` (from ``_file_metadata_inner``'s head_object)
+    # so no redundant S3 call is made — behavior is identical to the former
+    # inline implementation.
+    meta, file_size = _read_parquet_footer(s3, bucket, key, file_size)
 
     schema = meta.schema.to_arrow_schema()
     columns = []
@@ -5577,6 +5572,150 @@ def _read_avro_metadata(bucket: str, key: str, file_size: int):
         "columns": columns,
         "file_size": file_size,
     }
+
+
+@app.get("/api/buckets/{bucket}/parquet-rows")
+def parquet_rows(
+    bucket: str,
+    key: str,
+    limit: int = Query(100, ge=1, le=PARQUET_ROW_LIMIT_MAX),
+    offset: int = Query(0, ge=0),
+    columns: Optional[str] = Query(None),
+    user: dict = Depends(get_current_user),
+):
+    """Return actual decoded rows for a Parquet file (Tier 1 core preview).
+
+    Files ≤ ``PARQUET_PREVIEW_SMALL_FILE`` (32 MB) are read in full and decoded
+    with pyarrow; larger files return a schema-only response
+    (``read_mode == "too_large"``) so the frontend can show the structure
+    without the server OOMing on a multi-hundred-MB object.
+
+    Response contract (frozen — the frontend Data tab depends on this exactly):
+    ``{columns, rows, total_rows, offset, limit, truncated, next_offset, read_mode}``.
+    """
+    _acquire_metadata_slot()
+    try:
+        ext = key.rsplit(".", 1)[-1].lower() if "." in key else ""
+        if ext != "parquet":
+            raise HTTPException(400, f"Unsupported file type: .{ext}")
+        # Parse the comma-separated column allowlist: split on ",", strip
+        # whitespace and drop empties (so "a,,b," → ["a", "b"]).
+        column_list = None
+        if columns:
+            column_list = [c.strip() for c in columns.split(",") if c.strip()]
+        return _read_parquet_rows(
+            s3, bucket, key, limit=limit, offset=offset, columns=column_list
+        )
+    finally:
+        _metadata_semaphore.release()
+
+
+@app.get("/api/buckets/{bucket}/parquet-stream")
+def parquet_stream(
+    bucket: str,
+    key: str,
+    user: dict = Depends(get_current_user),
+):
+    """Stream a Parquet object's bytes same-origin for duckdb-wasm (Tier 2).
+
+    duckdb-wasm runs in the browser and needs the raw Parquet bytes. Direct
+    browser→S3 ``fetch()`` with ``Range`` is cross-origin / CORS-restricted on
+    read-only / third-party buckets, so we route the bytes same-origin through
+    Sairo (arch §3 "Critical decision"). The proxy is hard size-capped at
+    ``PARQUET_STREAM_CAP`` (128 MB) so a user can't stream a huge file through
+    the server; above the cap the SQL tab is hidden and the user is directed to
+    the Tier 1 Data tab for row preview.
+
+    Concurrency is bounded by a DEDICATED ``_stream_semaphore(2)``, not the
+    shared metadata gate. Streaming is duration-bound I/O, not resident-memory-
+    bound: ``iter_chunks(64KB)`` keeps only ~64KB × concurrency in memory
+    regardless of the 128MB cap, but a single download can occupy a slot for
+    seconds-to-minutes. Routing it through ``_metadata_semaphore`` (sized for
+    4 × 32MB pyarrow decode resident memory) would let a SQL-tab user
+    429-starve the Tier 1 core path (``parquet-rows`` / ``file-metadata`` /
+    ``preview``) for the entire download window and burn Starlette threadpool
+    workers on the 5s acquire timeout. A dedicated gate isolates that latency;
+    worst case 2 × 128MB throughput is trivial. This is the documented
+    divergence from arch §2 constraint #5 the escape hatch there requires.
+
+    The slot lifecycle is the load-bearing detail here:
+
+      * Acquired synchronously up front so a capacity 429 is returned as a real
+        HTTP status — never mid-stream after headers are sent.
+      * ``head_object`` runs synchronously so 404 (missing key) and 413 (file
+        too large) are returned with a correct status and a released slot,
+        before any byte is streamed.
+      * Once streaming starts, the generator owns the permit and releases it in
+        a ``finally`` — this runs on BOTH normal completion AND a client
+        disconnect (Starlette closes the generator → ``GeneratorExit`` → the
+        ``finally`` still fires).
+    """
+    _acquire_stream_slot()
+    # Pre-stream validation: ext check + head_object + size cap. Any error here
+    # must release the slot before raising — the generator below never gets to
+    # run on these paths, so it can't release for us. We deliberately do NOT
+    # wrap the whole handler in try/finally: the `finally` would fire when this
+    # function *returns* the StreamingResponse, releasing the slot long before
+    # the body finishes streaming. So errors release manually; the generator
+    # releases on completion/disconnect.
+    try:
+        ext = key.rsplit(".", 1)[-1].lower() if "." in key else ""
+        if ext != "parquet":
+            raise HTTPException(400, f"Unsupported file type: .{ext}")
+
+        try:
+            head = s3.head_object(Bucket=bucket, Key=key)
+        except ClientError as e:
+            if "NoSuchKey" in str(e) or "NotFound" in str(e):
+                raise HTTPException(404, "Object not found")
+            raise
+
+        # ContentLength is mandatory: without it the size cap is silently
+        # bypassed and we'd advertise ``Content-Length: 0`` while real bytes
+        # stream. Real S3/MinIO always return it, so this only triggers
+        # pathologically — but close the hole rather than stream blind.
+        size = head.get("ContentLength")
+        if size is None:
+            raise HTTPException(
+                413,
+                "Unable to determine object size; cannot stream",
+            )
+        if size > PARQUET_STREAM_CAP:
+            raise HTTPException(
+                413,
+                "File too large to stream (max 128MB); use the Data tab for row preview",
+            )
+    except Exception:
+        # 400 / 404 / 413 / unexpected — give the permit back, then propagate.
+        _stream_semaphore.release()
+        raise
+
+    basename = key.rsplit("/", 1)[-1] if "/" in key else key
+
+    def _gen():
+        try:
+            yield from _stream_object(s3, bucket, key)
+        finally:
+            _stream_semaphore.release()
+
+    # Wrap the constructor so a failure AFTER the slot is acquired but BEFORE
+    # iteration starts (e.g. a CRLF/control char in ``key`` poisoning the
+    # Content-Disposition header) releases the permit. ``StreamingResponse.__init__``
+    # only stores the body_iterator; it does NOT start iteration, so this can't
+    # double-release after the first yield.
+    try:
+        return StreamingResponse(
+            _gen(),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'inline; filename="{basename}"',
+                "Content-Length": str(size),
+                "Cache-Control": "no-store",
+            },
+        )
+    except BaseException:
+        _stream_semaphore.release()
+        raise
 
 
 @app.get("/api/buckets/{bucket}/preview-tail")

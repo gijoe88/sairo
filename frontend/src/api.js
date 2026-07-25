@@ -502,6 +502,41 @@ export async function fetchFileMetadata(bucket, key) {
   return res.json();
 }
 
+// Parquet row sampling (Tier 1). Mirrors fetchFileMetadata's conventions.
+// `columns` is optional; when provided it is comma-joined for projection.
+// `limit` is clamped client-side to the backend max (1000) — never request more.
+export async function fetchParquetRows(bucket, key, { limit = 100, offset = 0, columns } = {}) {
+  const safeLimit = Math.min(1000, Math.max(1, Number(limit) || 100));
+  const params = new URLSearchParams({
+    key,
+    limit: String(safeLimit),
+    offset: String(Math.max(0, Number(offset) || 0)),
+  });
+  if (columns != null && columns.length > 0) {
+    params.set("columns", Array.isArray(columns) ? columns.join(",") : String(columns));
+  }
+  const res = await apiFetch(`${bucketBase(bucket)}/parquet-rows?${params}`);
+  if (!res.ok) throw new Error(`Parquet rows failed: ${res.status}`);
+  return res.json();
+}
+
+// Hard size cap for the Tier 2 SQL-tab byte proxy. This MUST match the backend
+// `PARQUET_STREAM_CAP` (128 MB) in backend/main.py — the proxy refuses anything
+// larger, so the SQL tab is hidden above this threshold to avoid a guaranteed
+// 413. Imported by FilePreview for tab gating and defensively by the console.
+export const PARQUET_STREAM_CAP = 128 * 1024 * 1024;
+
+// Parquet byte stream (Tier 2). Streams the raw object bytes same-origin so the
+// browser can hand them to duckdb-wasm without CORS issues. Returns the fetch
+// Response; the caller is responsible for `new Uint8Array(await res.arrayBuffer())`.
+// The backend hard-caps this at PARQUET_STREAM_CAP (128 MB) and serves
+// `application/octet-stream`.
+export async function streamParquetBytes(bucket, key) {
+  const params = new URLSearchParams({ key });
+  const res = await apiFetch(`${bucketBase(bucket)}/parquet-stream?${params}`);
+  return res;
+}
+
 // ── Version Operations ──────────────────────────────────
 
 export async function versionRestore(bucket, key, versionId) {

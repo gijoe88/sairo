@@ -2,6 +2,17 @@
 
 All notable changes to Sairo are documented here. This project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Parquet preview now shows actual row content (Data tab) plus an optional in-browser SQL console.
+
+### Added
+
+- **Parquet row preview (Data tab)** — opening a `.parquet` file in the preview modal now exposes a **Data** tab that shows the file's actual decoded rows, not just its schema. Rows are decoded server-side with `pyarrow` via the new `GET /api/buckets/{bucket}/parquet-rows` endpoint, so it works on **every** bucket — including read-only or CORS-locked third-party buckets where a direct browser→S3 read would fail. Files up to **32 MB** are paginated with column projection (up to 1000 rows per page, virtualized); larger files return a friendly "file is too large to preview rows — showing schema only" response and fall back to the Schema tab. The existing schema panel is preserved verbatim as the **Schema** tab; ORC and Avro files still show the Schema tab only (no row preview).
+- **In-browser SQL console for Parquet (SQL tab, optional)** — for Parquet files **≤ 128 MB**, a new **SQL** tab runs ad-hoc SQL entirely client-side via [`@duckdb/duckdb-wasm`](https://duckdb.org/) (pinned to stable `1.32.0`). Queries run against a read-only view named `t` (e.g. `SELECT * FROM t LIMIT 100`). The ~34 MB SQL engine is lazily loaded — it downloads only the first time the SQL tab is opened and is cached thereafter; it is never part of the initial page bundle. The file bytes are routed same-origin through the new `GET /api/buckets/{bucket}/parquet-stream` endpoint (hard size cap 128 MB) to avoid the CORS failure mode of direct browser→S3 reads; the tab is hidden for larger files, where the Data tab still works.
+
+Targeted row-group range reading so the Data tab can preview actual rows for Parquet files larger than 32 MB (instead of the schema-only message) is planned for the next release.
+
 ## [3.6.0] - 2026-06-29
 
 Generic OpenID Connect SSO + a real per-bucket access UI (issue #9).

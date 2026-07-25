@@ -1,5 +1,11 @@
-import React, { useState, useEffect } from "react";
-import { getPresignedUrl, fetchPreview, fetchPreviewTail, fetchFileMetadata, formatSize } from "../api";
+import React, { useState, useEffect, lazy, Suspense } from "react";
+import { getPresignedUrl, fetchPreview, fetchPreviewTail, fetchFileMetadata, formatSize, PARQUET_STREAM_CAP } from "../api";
+import ParquetDataTable from "./ParquetDataTable";
+
+// Tier 2 SQL console is loaded on demand via React.lazy so the ~34MB duckdb-wasm
+// bundle (worker + WASM + glue) lands in a SEPARATE chunk, never in the initial
+// index-*.js. It is only fetched the first time a user opens the SQL tab.
+const ParquetSqlConsole = lazy(() => import("./ParquetSqlConsole"));
 
 const IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "svg", "webp", "ico", "bmp"];
 const TEXT_EXTS = ["txt", "md", "json", "csv", "xml", "yaml", "yml", "js", "jsx", "ts", "tsx", "py", "sql", "sh", "bash", "conf", "cfg", "ini", "env", "html", "css", "toml", "properties", "java", "go", "rs", "rb", "php", "c", "cpp", "h"];
@@ -135,10 +141,17 @@ export default function FilePreview({ bucket, fileKey, size, onClose }) {
   const [logMode, setLogMode] = useState("tail"); // "tail" or "head"
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // Schema-type preview: which tab is active. "schema" is the default so the
+  // existing SchemaPreview UX is preserved unchanged when a file opens. "sql"
+  // is only reachable for files at or under the Tier 2 proxy cap (128MB).
+  const [previewTab, setPreviewTab] = useState("schema"); // "schema" | "data" | "sql"
 
   const type = getPreviewType(fileKey);
   const ext = getExt(fileKey);
   const filename = fileKey.split("/").pop();
+  // SQL tab is shown only for schema-type files within the proxy cap. Computed
+  // once per render; gates both the tab button and the SQL route in renderContent.
+  const sqlTabAvailable = type === "schema" && typeof size === "number" && size <= PARQUET_STREAM_CAP;
 
   // Esc closes the preview
   useEffect(() => {
@@ -153,6 +166,8 @@ export default function FilePreview({ bucket, fileKey, size, onClose }) {
     setMetadata(null);
     setLogData(null);
     setContent(null);
+    // Re-opening a different file always starts on the Schema tab.
+    setPreviewTab("schema");
 
     if (type === "image" || type === "pdf") {
       getPresignedUrl(bucket, fileKey, 3600).then(data => {
@@ -203,6 +218,24 @@ export default function FilePreview({ bucket, fileKey, size, onClose }) {
   };
 
   const renderContent = () => {
+    // Data tab is lazy: only mounted when the user selects it, so opening the
+    // modal never fetches rows unless Data is clicked. It owns its own fetch /
+    // loading / error state, so bypass the schema-metadata loading gate below.
+    if (type === "schema" && previewTab === "data") {
+      return <ParquetDataTable bucket={bucket} objectKey={fileKey} key={fileKey} />;
+    }
+
+    // SQL tab pulls the duckdb-wasm chunk via React.lazy. Suspense shows a
+    // spinner while the chunk (and, on first open, the WASM) downloads. Like
+    // the Data tab, the console owns its own boot state, so bypass the gate.
+    if (type === "schema" && previewTab === "sql" && sqlTabAvailable) {
+      return (
+        <Suspense fallback={<div className="empty"><div className="spinner" /> Loading SQL console…</div>}>
+          <ParquetSqlConsole bucket={bucket} objectKey={fileKey} fileSize={size} key={fileKey} />
+        </Suspense>
+      );
+    }
+
     if (loading) return <div className="empty"><div className="spinner" /> Loading preview...</div>;
     if (error) return <div className="empty" style={{ color: "var(--danger)" }}>Error: {error}</div>;
 
@@ -311,6 +344,36 @@ export default function FilePreview({ bucket, fileKey, size, onClose }) {
               <div className="log-mode-toggle">
                 <button className={`log-mode-btn ${logMode === "tail" ? "log-mode-active" : ""}`} onClick={() => switchLogMode("tail")}>Tail</button>
                 <button className={`log-mode-btn ${logMode === "head" ? "log-mode-active" : ""}`} onClick={() => switchLogMode("head")}>Head</button>
+              </div>
+            )}
+            {type === "schema" && (
+              <div className="log-mode-toggle" role="tablist" aria-label="Preview view">
+                <button
+                  type="button"
+                  data-testid="schema-tab"
+                  role="tab"
+                  aria-selected={previewTab === "schema"}
+                  className={`log-mode-btn ${previewTab === "schema" ? "log-mode-active" : ""}`}
+                  onClick={() => setPreviewTab("schema")}
+                >Schema</button>
+                <button
+                  type="button"
+                  data-testid="data-tab"
+                  role="tab"
+                  aria-selected={previewTab === "data"}
+                  className={`log-mode-btn ${previewTab === "data" ? "log-mode-active" : ""}`}
+                  onClick={() => setPreviewTab("data")}
+                >Data</button>
+                {sqlTabAvailable && (
+                  <button
+                    type="button"
+                    data-testid="sql-tab"
+                    role="tab"
+                    aria-selected={previewTab === "sql"}
+                    className={`log-mode-btn ${previewTab === "sql" ? "log-mode-active" : ""}`}
+                    onClick={() => setPreviewTab("sql")}
+                  >SQL</button>
+                )}
               </div>
             )}
             <span className="muted" style={{ fontSize: 12 }}>{formatSize(size)}</span>

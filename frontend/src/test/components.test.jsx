@@ -8,7 +8,7 @@
  *   5. Upload time remaining (formatEta)
  *   6. Drop overlay with target prefix
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import React from "react";
 
@@ -362,7 +362,6 @@ describe("ObjectTable compact mode", () => {
       />
     );
 
-    // Virtual rows may not render in jsdom (no dimensions), but footer should
     expect(container.querySelector(".table-footer")).toBeTruthy();
     expect(screen.getByText("0 folders, 1 file")).toBeInTheDocument();
   });
@@ -788,5 +787,449 @@ describe("Drop overlay prefix", () => {
 
     const strong = container.querySelector("strong");
     expect(strong.textContent).toBe("test-data/");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. PARQUET DATA TAB (ParquetDataTable)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Build a parquet-rows payload matching the FROZEN T2 backend contract.
+function makeRowsPayload(overrides = {}) {
+  return {
+    columns: [
+      { name: "id", type: "int64" },
+      { name: "name", type: "string" },
+      { name: "tags", type: "list<string>" },
+    ],
+    rows: [
+      [1, "alice", '["alpha","beta"]'],
+      [2, "bob", '["gamma"]'],
+    ],
+    total_rows: 2,
+    offset: 0,
+    limit: 100,
+    truncated: false,
+    next_offset: null,
+    read_mode: "full",
+    ...overrides,
+  };
+}
+
+function mockFetchParquetRows(payloadFn) {
+  global.fetch.mockImplementation((url) => {
+    const u = String(url);
+    if (u.includes("/parquet-rows")) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(typeof payloadFn === "function" ? payloadFn(u) : payloadFn),
+      });
+    }
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) });
+  });
+}
+
+// jsdom lays out every element with zero size, so @tanstack/react-virtual sees
+// an empty viewport and renders no rows. This installs the stubs the virtualizer
+// needs (non-zero element dimensions + a ResizeObserver no-op) and returns a
+// restore function. Scope it to Parquet describe blocks via beforeAll/afterAll
+// so the rest of the suite runs with default jsdom behavior.
+function installVirtualizerStubs() {
+  const proto = window.HTMLElement.prototype;
+  const originalDescriptors = {
+    offsetHeight: Object.getOwnPropertyDescriptor(proto, "offsetHeight"),
+    clientHeight: Object.getOwnPropertyDescriptor(proto, "clientHeight"),
+    scrollHeight: Object.getOwnPropertyDescriptor(proto, "scrollHeight"),
+  };
+  Object.defineProperties(proto, {
+    offsetHeight: { get: () => 600, configurable: true },
+    clientHeight: { get: () => 600, configurable: true },
+    scrollHeight: { get: () => 600, configurable: true },
+  });
+  const originalResizeObserver = global.ResizeObserver;
+  global.ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+  return function restore() {
+    for (const [prop, desc] of Object.entries(originalDescriptors)) {
+      if (desc) Object.defineProperty(proto, prop, desc);
+      else delete proto[prop];
+    }
+    global.ResizeObserver = originalResizeObserver;
+  };
+}
+
+describe("ParquetDataTable", () => {
+  let restoreVirtualizerStubs;
+  beforeAll(() => { restoreVirtualizerStubs = installVirtualizerStubs(); });
+  afterAll(() => { restoreVirtualizerStubs(); });
+
+  it("renders column headers, scalar rows, and JSON-encoded list cells verbatim", async () => {
+    mockFetchParquetRows(makeRowsPayload());
+
+    const { default: ParquetDataTable } = await import("../components/ParquetDataTable");
+    render(<ParquetDataTable bucket="bkt" objectKey="data/sample.parquet" />);
+
+    // Column headers (name + type subtitle)
+    await waitFor(() => {
+      expect(screen.getByText("id")).toBeInTheDocument();
+    });
+    expect(screen.getByText("name")).toBeInTheDocument();
+    expect(screen.getByText("int64")).toBeInTheDocument();
+
+    // Scalar cells render normally; list cell renders as the JSON string verbatim
+    expect(screen.getByText("alice")).toBeInTheDocument();
+    expect(screen.getByText("bob")).toBeInTheDocument();
+    // '["alpha","beta"]' arrives as a string and must NOT be parsed into an object
+    expect(screen.getByText('["alpha","beta"]')).toBeInTheDocument();
+  });
+
+  it("clicking Next fetches the next page using next_offset", async () => {
+    // Page 1 reports a next page at offset 100.
+    mockFetchParquetRows(makeRowsPayload({
+      rows: [[1, "alice", '["alpha"]']],
+      total_rows: 200,
+      offset: 0,
+      truncated: true,
+      next_offset: 100,
+    }));
+
+    const { default: ParquetDataTable } = await import("../components/ParquetDataTable");
+    render(<ParquetDataTable bucket="bkt" objectKey="data/sample.parquet" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("alice")).toBeInTheDocument();
+    });
+
+    const nextBtn = screen.getByRole("button", { name: "Next page" });
+    expect(nextBtn).not.toBeDisabled();
+
+    fireEvent.click(nextBtn);
+
+    await waitFor(() => {
+      // The second page request must use offset=100
+      const offsets = global.fetch.mock.calls
+        .map(([url]) => String(url))
+        .filter((u) => u.includes("/parquet-rows"))
+        .filter((u) => u.includes("offset=100"));
+      expect(offsets.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("disables the Next button when truncated is false", async () => {
+    mockFetchParquetRows(makeRowsPayload({ truncated: false, next_offset: null }));
+
+    const { default: ParquetDataTable } = await import("../components/ParquetDataTable");
+    render(<ParquetDataTable bucket="bkt" objectKey="data/sample.parquet" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("alice")).toBeInTheDocument();
+    });
+
+    expect(screen.getByRole("button", { name: "Next page" })).toBeDisabled();
+    // Prev is disabled too at offset 0
+    expect(screen.getByRole("button", { name: "Previous page" })).toBeDisabled();
+  });
+
+  it("renders the friendly message and no table when read_mode is too_large", async () => {
+    mockFetchParquetRows(makeRowsPayload({ read_mode: "too_large", rows: [], columns: [] }));
+
+    const { default: ParquetDataTable } = await import("../components/ParquetDataTable");
+    const { container } = render(<ParquetDataTable bucket="bkt" objectKey="big.parquet" />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/File is too large to preview rows/i)).toBeInTheDocument();
+    });
+
+    // No table, no pagination buttons
+    expect(container.querySelector(".preview-csv-table")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Next page" })).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. FILE PREVIEW — SCHEMA/DATA TAB SWITCHING
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("FilePreview schema/data tabs", () => {
+  let restoreVirtualizerStubs;
+  beforeAll(() => { restoreVirtualizerStubs = installVirtualizerStubs(); });
+  afterAll(() => { restoreVirtualizerStubs(); });
+
+  const parquetMetadata = {
+    format: "parquet",
+    num_rows: 2,
+    num_columns: 2,
+    columns: [
+      { name: "id", type: "int64", nullable: true },
+      { name: "name", type: "string", nullable: true },
+    ],
+    file_size: 100,
+    num_row_groups: 1,
+    compression: "snappy",
+    created_by: "sairo-test",
+  };
+
+  function mockSchemaAndRows(rowsPayload) {
+    global.fetch.mockImplementation((url) => {
+      const u = String(url);
+      if (u.includes("/file-metadata")) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(parquetMetadata) });
+      }
+      if (u.includes("/parquet-rows")) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(rowsPayload) });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) });
+    });
+  }
+
+  it("defaults to the Schema tab; switching to Data renders rows; switching back does not refetch schema", async () => {
+    mockSchemaAndRows(makeRowsPayload());
+
+    const { default: FilePreview } = await import("../components/FilePreview");
+    render(<FilePreview bucket="bkt" fileKey="data/sample.parquet" size={100} onClose={vi.fn()} />);
+
+    // Default Schema tab renders the schema badge + table once metadata resolves
+    await waitFor(() => {
+      expect(screen.getByText("PARQUET")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("schema-tab")).toHaveAttribute("aria-selected", "true");
+
+    const metadataCallsBefore = global.fetch.mock.calls
+      .filter(([url]) => String(url).includes("/file-metadata")).length;
+    expect(metadataCallsBefore).toBe(1);
+
+    // Switch to the Data tab — rows fetch + render
+    fireEvent.click(screen.getByTestId("data-tab"));
+    await waitFor(() => {
+      expect(screen.getByText("alice")).toBeInTheDocument();
+    });
+
+    // Switch back to Schema — schema must NOT be refetched (count unchanged)
+    fireEvent.click(screen.getByTestId("schema-tab"));
+    await waitFor(() => {
+      expect(screen.getByText("PARQUET")).toBeInTheDocument();
+    });
+
+    const metadataCallsAfter = global.fetch.mock.calls
+      .filter(([url]) => String(url).includes("/file-metadata")).length;
+    expect(metadataCallsAfter).toBe(1);
+  });
+
+  it("shows the SQL tab for files at/below the 128MB cap", async () => {
+    mockSchemaAndRows(makeRowsPayload());
+
+    const { default: FilePreview } = await import("../components/FilePreview");
+    render(<FilePreview bucket="bkt" fileKey="data/sample.parquet" size={100} onClose={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByText("PARQUET")).toBeInTheDocument());
+    expect(screen.getByTestId("sql-tab")).toBeInTheDocument();
+  });
+
+  it("hides the SQL tab for files above the 128MB cap", async () => {
+    mockSchemaAndRows(makeRowsPayload());
+
+    const { default: FilePreview } = await import("../components/FilePreview");
+    // 200MB — over PARQUET_STREAM_CAP. Schema | Data still present, SQL absent.
+    render(<FilePreview bucket="bkt" fileKey="big.parquet" size={200 * 1024 * 1024} onClose={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByText("PARQUET")).toBeInTheDocument());
+    expect(screen.queryByTestId("sql-tab")).toBeNull();
+    // Schema + Data tabs remain available above the cap.
+    expect(screen.getByTestId("schema-tab")).toBeInTheDocument();
+    expect(screen.getByTestId("data-tab")).toBeInTheDocument();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. PARQUET SQL CONSOLE (ParquetSqlConsole) — Tier 2
+//
+// Real duckdb-wasm can't instantiate under jsdom, so the lazy singleton is
+// mocked with controllable vi.fn()s. The parquet-stream fetch is mocked at the
+// global.fetch level (streamParquetBytes is a thin wrapper over apiFetch→fetch).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// vi.hoisted so the mock factory (which vitest hoists above all imports) can
+// reference these vi.fn()s. Top-level let/const would not be in scope there.
+const duckdbMocks = vi.hoisted(() => ({
+  getDuckDB: vi.fn(),
+  register: vi.fn(),
+  query: vi.fn(),
+  reset: vi.fn(),
+}));
+vi.mock("../lib/duckdb", () => ({
+  getDuckDB: duckdbMocks.getDuckDB,
+  register: duckdbMocks.register,
+  query: duckdbMocks.query,
+  reset: duckdbMocks.reset,
+}));
+
+// Build a fake fetch Response for /parquet-stream: ok=true, arrayBuffer()→buf.
+// `bytes` defaults to a tiny non-empty payload (the mocked register ignores it).
+function mockParquetStreamFetch(bytes = [1, 2, 3, 4]) {
+  global.fetch.mockImplementation((url) => {
+    const u = String(url);
+    if (u.includes("/parquet-stream")) {
+      const ab = new ArrayBuffer(bytes.length);
+      new Uint8Array(ab).set(bytes);
+      return Promise.resolve({ ok: true, status: 200, arrayBuffer: () => Promise.resolve(ab) });
+    }
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) });
+  });
+}
+
+describe("ParquetSqlConsole", () => {
+  let restoreVirtualizerStubs;
+  beforeAll(() => { restoreVirtualizerStubs = installVirtualizerStubs(); });
+  afterAll(() => { restoreVirtualizerStubs(); });
+
+  beforeEach(() => {
+    duckdbMocks.getDuckDB.mockReset();
+    duckdbMocks.register.mockReset();
+    duckdbMocks.query.mockReset();
+    duckdbMocks.reset.mockReset();
+    // Sensible defaults; individual tests override as needed.
+    duckdbMocks.getDuckDB.mockResolvedValue({ db: {}, conn: {} });
+    duckdbMocks.register.mockResolvedValue(undefined);
+    duckdbMocks.reset.mockResolvedValue(undefined);
+    duckdbMocks.query.mockResolvedValue({ columns: [], rows: [] });
+    mockParquetStreamFetch();
+  });
+
+  it("boots through fetching → engine → ready, then runs a query and renders columns + rows", async () => {
+    duckdbMocks.query.mockResolvedValue({
+      columns: ["id", "name"],
+      rows: [[1, "alice"], [2, "bob"]],
+    });
+
+    const { default: ParquetSqlConsole } = await import("../components/ParquetSqlConsole");
+    render(<ParquetSqlConsole bucket="bkt" objectKey="data/sample.parquet" fileSize={100} />);
+
+    // Fetch happened (parquet-stream called) and register was invoked with 't'.
+    await waitFor(() => {
+      expect(duckdbMocks.register).toHaveBeenCalledTimes(1);
+    });
+    // register called with the FIXED view name 't' — never derived from input.
+    expect(duckdbMocks.register.mock.calls[0][1]).toBe("t");
+
+    // The default query is prefilled in the editor.
+    const editor = screen.getByLabelText("SQL editor");
+    expect(editor.value).toBe("SELECT * FROM t LIMIT 100;");
+
+    // Run it.
+    const runBtn = screen.getByRole("button", { name: "Run" });
+    fireEvent.click(runBtn);
+
+    await waitFor(() => {
+      expect(duckdbMocks.query).toHaveBeenCalledWith("SELECT * FROM t LIMIT 100;");
+    });
+
+    // Results table renders the column headers and row cells.
+    await waitFor(() => {
+      expect(screen.getByText("id")).toBeInTheDocument();
+    });
+    expect(screen.getByText("name")).toBeInTheDocument();
+    expect(screen.getByText("alice")).toBeInTheDocument();
+    expect(screen.getByText("bob")).toBeInTheDocument();
+  });
+
+  it("shows an inline error (red) when query throws, and keeps the console intact", async () => {
+    // First a successful query so we have prior results, then a failure.
+    duckdbMocks.query.mockResolvedValueOnce({ columns: ["id"], rows: [[1]] });
+    duckdbMocks.query.mockRejectedValueOnce(new Error("syntax error near 'FROMM'"));
+
+    const { default: ParquetSqlConsole } = await import("../components/ParquetSqlConsole");
+    const { container } = render(<ParquetSqlConsole bucket="bkt" objectKey="data/sample.parquet" fileSize={100} />);
+
+    await waitFor(() => expect(duckdbMocks.register).toHaveBeenCalledTimes(1));
+
+    // Successful first run.
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    await waitFor(() => expect(screen.getByText("id")).toBeInTheDocument());
+
+    // Bad query second run.
+    const editor = screen.getByLabelText("SQL editor");
+    fireEvent.change(editor, { target: { value: "SELECT 1 FROMM t" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+
+    await waitFor(() => {
+      expect(container.querySelector(".sql-query-error")).toBeTruthy();
+    });
+    expect(container.querySelector(".sql-query-error").textContent).toMatch(/syntax error/);
+
+    // Console did NOT crash: the editor + results table are still present.
+    expect(screen.getByLabelText("SQL editor")).toBeInTheDocument();
+    expect(container.querySelector(".preview-csv-table")).toBeTruthy();
+  });
+
+  it("calls reset() on unmount to drop the per-file view", async () => {
+    const { default: ParquetSqlConsole } = await import("../components/ParquetSqlConsole");
+    const { unmount } = render(<ParquetSqlConsole bucket="bkt" objectKey="data/sample.parquet" fileSize={100} />);
+
+    await waitFor(() => expect(duckdbMocks.register).toHaveBeenCalledTimes(1));
+    expect(duckdbMocks.reset).not.toHaveBeenCalled();
+
+    unmount();
+    await waitFor(() => expect(duckdbMocks.reset).toHaveBeenCalledTimes(1));
+  });
+
+  it("read-only guard rejects DELETE / DROP with a friendly message and skips the engine", async () => {
+    const { default: ParquetSqlConsole } = await import("../components/ParquetSqlConsole");
+    render(<ParquetSqlConsole bucket="bkt" objectKey="data/sample.parquet" fileSize={100} />);
+
+    await waitFor(() => expect(duckdbMocks.register).toHaveBeenCalledTimes(1));
+
+    const editor = screen.getByLabelText("SQL editor");
+
+    // DELETE
+    fireEvent.change(editor, { target: { value: "DELETE FROM t" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    await waitFor(() => {
+      expect(screen.getByText("Only read-only SELECT queries are supported.")).toBeInTheDocument();
+    });
+
+    // DROP (with a leading comment + whitespace to exercise the stripper)
+    fireEvent.change(editor, { target: { value: "  /* nuke */ DROP TABLE t" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(screen.getByText("Only read-only SELECT queries are supported.")).toBeInTheDocument();
+
+    // The query() mock must never have been invoked for these.
+    expect(duckdbMocks.query).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a fetch error gracefully instead of crashing when the stream fails", async () => {
+    // Simulate a 413/404: apiFetch throws because res.ok is false.
+    global.fetch.mockImplementation((url) => {
+      const u = String(url);
+      if (u.includes("/parquet-stream")) {
+        return Promise.resolve({ ok: false, status: 413, json: () => Promise.resolve({ detail: "File too large" }) });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) });
+    });
+
+    const { default: ParquetSqlConsole } = await import("../components/ParquetSqlConsole");
+    const { container } = render(<ParquetSqlConsole bucket="bkt" objectKey="big.parquet" fileSize={100} />);
+
+    await waitFor(() => {
+      expect(container.querySelector(".empty")).toBeTruthy();
+      expect(container.textContent).toMatch(/Couldn.t load the file for SQL/);
+    });
+    // Engine must NOT have been registered for a failed fetch.
+    expect(duckdbMocks.register).not.toHaveBeenCalled();
+  });
+
+  it("renders the friendly cap message and never fetches when fileSize exceeds the cap", async () => {
+    const { default: ParquetSqlConsole } = await import("../components/ParquetSqlConsole");
+    const { container } = render(
+      <ParquetSqlConsole bucket="bkt" objectKey="huge.parquet" fileSize={200 * 1024 * 1024} />
+    );
+
+    expect(container.textContent).toMatch(/only available for files up to 128 MB/i);
+    // Defensive cap: no fetch, no engine.
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(duckdbMocks.register).not.toHaveBeenCalled();
   });
 });
