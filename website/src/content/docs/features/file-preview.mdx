@@ -19,7 +19,8 @@ Click any object in the browser to open an inline preview. Sairo detects the fil
 | **Data**     | csv                                             | Parsed table with column headers         |
 | **Data**     | json                                            | Pretty-printed with line numbers         |
 | **Logs**     | log, out, err                                   | Head/tail toggle for large files         |
-| **Analytics**| parquet, orc, avro                              | Schema + metadata inspection panel       |
+| **Analytics**| parquet                                         | Schema + row preview + optional SQL      |
+| **Analytics**| orc, avro                                       | Schema + metadata inspection panel       |
 | **Other**    | All other types                                 | Download prompt                          |
 
 ## Format details
@@ -50,7 +51,16 @@ Log and text files support a **head/tail toggle**. By default the preview shows 
 
 ### Parquet, ORC, and Avro
 
-For columnar and row-oriented data formats, Sairo displays the file's **schema** (column names and types) and **metadata** (row count, row groups, compression codec, creation library). This lets you inspect data files without downloading them or running a query engine.
+Opening a Parquet, ORC, or Avro file shows a tabbed preview. The **Schema** tab is always available and shows the file's **schema** (column names and types) and **metadata** (row count, row groups, compression codec, creation library) — so you can inspect columnar and row-oriented data files without downloading them or running a query engine.
+
+Parquet files get two additional tabs:
+
+- **Data** *(Parquet only)* — shows the file's actual decoded rows, not just its schema. Rows are decoded server-side with `pyarrow`, so this works on **every** bucket — including read-only or CORS-locked third-party buckets where a direct browser-to-storage read would fail. Files up to **32 MB** are paginated with column projection (up to 1000 rows per page, virtualized for large results). Above 32 MB the tab shows a friendly "file is too large to preview rows — showing schema only" message and the Schema tab remains fully usable. (Targeted row reading for larger files is planned for a follow-up release.)
+- **SQL** *(Parquet only, files up to 128 MB)* — an in-browser ad-hoc SQL console. Queries run entirely client-side against the file's bytes using [DuckDB](https://duckdb.org/) compiled to WebAssembly. The first time you open the SQL tab the engine downloads (a one-time ~34 MB download, cached thereafter); subsequent opens are instant, and nothing is added to the initial page bundle. Queries run against a read-only view named `t` — for example, `SELECT * FROM t LIMIT 100`. The tab is hidden for files larger than 128 MB; use the Data tab for those.
+
+<Aside>
+  Row preview (Data) and the SQL console are <strong>Parquet only</strong>. ORC and Avro files show the <strong>Schema</strong> tab — there is no row preview or SQL console for those formats.
+</Aside>
 
 ### Unsupported types
 

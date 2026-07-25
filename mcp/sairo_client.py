@@ -92,14 +92,22 @@ class SairoClient:
         except Exception:
             return None
 
-    async def get_user_permissions(self, username: str) -> dict[str, str]:
+    async def get_user_permissions(
+        self, username: str, user_token: Optional[str] = None
+    ) -> dict[str, str]:
         """
         Get bucket permissions for a user.
         Returns {bucket_name: permission_level} dict.
+
+        When ``user_token`` is provided the request is authenticated as that
+        user; otherwise it falls back to the server's service token
+        (backwards-compatible default).
         """
         try:
             resp = await self._request(
-                "GET", f"/api/auth/users/{username}/permissions"
+                "GET",
+                f"/api/auth/users/{username}/permissions",
+                user_token=user_token,
             )
             if resp.status_code == 200:
                 data = resp.json()

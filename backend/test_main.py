@@ -2058,3 +2058,783 @@ class TestFederatedUserEnumeration:
         assert resp.status_code == 401, \
             f"federated change-password must be 401, got {resp.status_code}"
         assert resp.json()["detail"] == "Current password is incorrect"
+
+# ── Parquet file-metadata contract (regression lock for the read_footer refactor) ──
+
+class TestParquetFileMetadata:
+    """Lock the JSON contract of GET /file-metadata for a Parquet key.
+
+    The footer-reading logic was moved into ``backend/parquet_reader.read_footer``;
+    this test guarantees the endpoint still returns the identical response shape
+    (same keys, field order, and values) by serving a real pyarrow-written
+    Parquet object through a fake S3 client patched in for ``main.s3``.
+    """
+
+    @staticmethod
+    def _build_parquet():
+        import io as _io
+        import pyarrow as _pa
+        import pyarrow.parquet as _pq
+
+        schema = _pa.schema(
+            [
+                _pa.field("id", _pa.int64()),
+                _pa.field("name", _pa.string()),
+            ]
+        )
+        table = _pa.table(
+            {
+                "id": _pa.array(list(range(10)), _pa.int64()),
+                "name": _pa.array([f"row{i}" for i in range(10)], _pa.string()),
+            },
+            schema=schema,
+        )
+        buf = _io.BytesIO()
+        _pq.write_table(table, buf)
+        return buf.getvalue()
+
+    def test_file_metadata_parquet_contract(self, client, admin_cookies):
+        """file-metadata returns the documented Parquet JSON shape end-to-end."""
+        import io as _io
+        import re as _re
+        from unittest.mock import patch
+
+        try:
+            from backend import main as main_mod
+        except ModuleNotFoundError:
+            import main as main_mod
+
+        data = self._build_parquet()
+
+        class _FakeS3:
+            def head_object(self, *, Bucket, Key):
+                return {"ContentLength": len(data)}
+
+            def get_object(self, *, Bucket, Key, Range):
+                m = _re.match(r"bytes=(\d+)-(\d+)", Range)
+                start, end = int(m.group(1)), int(m.group(2))
+                return {"Body": _io.BytesIO(data[start : end + 1])}
+
+        with patch.object(main_mod, "s3", _FakeS3()):
+            resp = client.get(
+                "/api/buckets/test-bucket/file-metadata?key=data/test.parquet",
+                cookies=admin_cookies,
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        # Top-level shape — key set and field order must match _read_parquet_metadata.
+        assert list(body.keys()) == [
+            "format", "num_rows", "num_columns", "num_row_groups",
+            "created_by", "columns", "row_groups", "file_size",
+        ]
+        assert body["format"] == "parquet"
+        assert body["num_rows"] == 10
+        assert body["num_columns"] == 2
+        assert body["num_row_groups"] == 1
+        assert body["file_size"] == len(data)
+        assert isinstance(body["created_by"], str)
+
+        # Columns reflect the written arrow schema.
+        assert body["columns"] == [
+            {"name": "id", "type": "int64", "nullable": True},
+            {"name": "name", "type": "string", "nullable": True},
+        ]
+
+        # row_groups carry num_rows + total_byte_size for the single group.
+        assert len(body["row_groups"]) == 1
+        assert body["row_groups"][0]["num_rows"] == 10
+        assert isinstance(body["row_groups"][0]["total_byte_size"], int)
+
+
+# ── Tier 1: GET /api/buckets/{bucket}/parquet-rows ─────────────────────────
+
+class TestParquetRowsEndpoint:
+    """End-to-end contract lock for the parquet-rows endpoint (T3 frontend relies
+    on this exact response shape). Serves a real pyarrow-written Parquet object
+    through a fake S3 client patched in for ``main.s3`` — same style as
+    :class:`TestParquetFileMetadata`, no moto.
+    """
+
+    @staticmethod
+    def _build_parquet_500():
+        import io as _io
+        import pyarrow as _pa
+        import pyarrow.parquet as _pq
+
+        schema = _pa.schema(
+            [
+                _pa.field("a", _pa.int64()),
+                _pa.field("b", _pa.string()),
+            ]
+        )
+        table = _pa.table(
+            {
+                "a": _pa.array(list(range(500)), _pa.int64()),
+                "b": _pa.array([f"row{i}" for i in range(500)], _pa.string()),
+            },
+            schema=schema,
+        )
+        buf = _io.BytesIO()
+        _pq.write_table(table, buf)
+        return buf.getvalue()
+
+    @staticmethod
+    def _fake_s3_for(data):
+        """Fake S3 serving a real in-memory Parquet buffer (head + range GET)."""
+        import io as _io
+        import re as _re
+
+        class _FakeS3:
+            def head_object(self, *, Bucket, Key):
+                return {"ContentLength": len(data)}
+
+            def get_object(self, *, Bucket, Key, Range=None):
+                if Range is None:  # full-object GET
+                    return {"Body": _io.BytesIO(data)}
+                m = _re.match(r"bytes=(\d+)-(\d+)", Range)
+                start, end = int(m.group(1)), int(m.group(2))
+                return {"Body": _io.BytesIO(data[start : end + 1])}
+
+        return _FakeS3()
+
+    @staticmethod
+    def _large_fake_s3_for(small, total):
+        """Virtual >32MB Parquet object without materializing 32MB+ in memory.
+
+        Layout: ``[0:4]=small[0:4]`` (PAR1 header), ``[4:4+pad]=0``,
+        ``[4+pad:total]=small[4:]``. The footer bytes are preserved at the tail
+        so ``read_footer`` parses correctly; only column-chunk offsets shift
+        into the gap, which footer parsing doesn't dereference.
+        """
+        import io as _io
+        import re as _re
+
+        pad = total - len(small)
+
+        class _LargeFakeS3:
+            def head_object(self, *, Bucket, Key):
+                return {"ContentLength": total}
+
+            def _byte(self, i):
+                if i < 4:
+                    return small[i]
+                if i < 4 + pad:
+                    return 0
+                return small[4 + (i - (4 + pad))]
+
+            def get_object(self, *, Bucket, Key, Range):
+                m = _re.match(r"bytes=(\d+)-(\d+)", Range)
+                start, end = int(m.group(1)), int(m.group(2))
+                return {"Body": _io.BytesIO(bytes(self._byte(i) for i in range(start, end + 1)))}
+
+        return _LargeFakeS3()
+
+    def test_happy_path_contract(self, client, admin_cookies):
+        """Small file: full row decode, pagination, exact JSON contract."""
+        from unittest.mock import patch
+
+        try:
+            from backend import main as main_mod
+        except ModuleNotFoundError:
+            import main as main_mod
+
+        data = self._build_parquet_500()
+        with patch.object(main_mod, "s3", self._fake_s3_for(data)):
+            resp = client.get(
+                "/api/buckets/test-bucket/parquet-rows?key=data/test.parquet"
+                "&limit=100&offset=0",
+                cookies=admin_cookies,
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # Frozen key set + order.
+        assert list(body.keys()) == [
+            "columns", "rows", "total_rows", "offset", "limit",
+            "truncated", "next_offset", "read_mode",
+        ]
+        assert body["read_mode"] == "full"
+        assert body["total_rows"] == 500
+        assert body["offset"] == 0
+        assert body["limit"] == 100
+        assert body["truncated"] is True
+        assert body["next_offset"] == 100
+        assert len(body["rows"]) == 100
+        assert body["rows"][0] == [0, "row0"]
+        assert body["columns"] == [
+            {"name": "a", "type": "int64"},
+            {"name": "b", "type": "string"},
+        ]
+
+    def test_column_projection_query_param(self, client, admin_cookies):
+        """?columns=a,b projects columns; rows contain only those, in order."""
+        from unittest.mock import patch
+
+        try:
+            from backend import main as main_mod
+        except ModuleNotFoundError:
+            import main as main_mod
+
+        data = self._build_parquet_500()
+        with patch.object(main_mod, "s3", self._fake_s3_for(data)):
+            resp = client.get(
+                "/api/buckets/test-bucket/parquet-rows?key=data/test.parquet"
+                "&limit=3&columns=b,a",  # reverse order on purpose
+                cookies=admin_cookies,
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert [c["name"] for c in body["columns"]] == ["b", "a"]
+        assert all(len(r) == 2 for r in body["rows"])
+        assert body["rows"][0] == ["row0", 0]
+
+    def test_unknown_column_returns_400(self, client, admin_cookies):
+        """Unknown column in ?columns= → 400 from the allowlist guard."""
+        from unittest.mock import patch
+
+        try:
+            from backend import main as main_mod
+        except ModuleNotFoundError:
+            import main as main_mod
+
+        data = self._build_parquet_500()
+        with patch.object(main_mod, "s3", self._fake_s3_for(data)):
+            resp = client.get(
+                "/api/buckets/test-bucket/parquet-rows?key=data/test.parquet"
+                "&limit=3&columns=doesnotexist",
+                cookies=admin_cookies,
+            )
+        assert resp.status_code == 400, resp.text
+        assert "doesnotexist" in resp.json()["detail"]
+
+    def test_limit_over_max_returns_422(self, client, admin_cookies):
+        """limit > PARQUET_ROW_LIMIT_MAX is rejected by the Query validator (422).
+
+        Decision: rely on FastAPI's ``Query(le=1000)`` rather than clamping
+        server-side, so the client gets an explicit signal to request fewer rows.
+        """
+        resp = client.get(
+            "/api/buckets/test-bucket/parquet-rows?key=data/test.parquet&limit=5000",
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 422, resp.text
+
+    def test_large_file_returns_too_large(self, client, admin_cookies):
+        """file_size > 32MB → HTTP 200 read_mode=='too_large', schema only."""
+        from unittest.mock import patch
+
+        try:
+            from backend import main as main_mod
+        except ModuleNotFoundError:
+            import main as main_mod
+
+        small = self._build_parquet_500()
+        total = 32 * 1024 * 1024 + 1024  # just over the 32MB cap
+        with patch.object(main_mod, "s3", self._large_fake_s3_for(small, total)):
+            resp = client.get(
+                "/api/buckets/test-bucket/parquet-rows?key=data/test.parquet&limit=100",
+                cookies=admin_cookies,
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["read_mode"] == "too_large"
+        assert body["rows"] == []
+        assert body["truncated"] is True
+        assert body["next_offset"] is None
+        # Schema + totals still accurate from the footer.
+        assert body["total_rows"] == 500
+        assert body["columns"] == [
+            {"name": "a", "type": "int64"},
+            {"name": "b", "type": "string"},
+        ]
+
+    def test_requires_auth(self, app):
+        """No auth cookie → 401 (never touches S3).
+
+        Uses a fresh ``TestClient`` so cookies persisted by earlier tests on the
+        shared module-scoped client don't leak in (mirrors TestCompatPermissions).
+        """
+        with TestClient(app) as fresh:
+            resp = fresh.get("/api/buckets/test-bucket/parquet-rows?key=data/test.parquet")
+        assert resp.status_code == 401
+
+    def test_non_parquet_ext_returns_400(self, client, admin_cookies):
+        """A non-Parquet key is rejected with 400 before any row decoding."""
+        resp = client.get(
+            "/api/buckets/test-bucket/parquet-rows?key=data/test.csv",
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 400, resp.text
+        assert "Unsupported file type" in resp.json()["detail"]
+
+    def test_not_found_key_returns_404(self, client, admin_cookies):
+        """A missing object surfaces read_footer's 404 (NoSuchKey → 'Object not found')."""
+        from unittest.mock import patch
+        from botocore.exceptions import ClientError as _CE
+
+        try:
+            from backend import main as main_mod
+        except ModuleNotFoundError:
+            import main as main_mod
+
+        not_found = _CE({"Error": {"Code": "NoSuchKey", "Message": "Not Found"}}, "HeadObject")
+
+        class _MissingS3:
+            def head_object(self, *, Bucket, Key):
+                raise not_found
+
+            def get_object(self, *, Bucket, Key, Range=None):  # pragma: no cover
+                raise AssertionError("body GET must not happen on a missing object")
+
+        with patch.object(main_mod, "s3", _MissingS3()):
+            resp = client.get(
+                "/api/buckets/test-bucket/parquet-rows?key=data/missing.parquet",
+                cookies=admin_cookies,
+            )
+        assert resp.status_code == 404, resp.text
+        assert resp.json()["detail"] == "Object not found"
+
+    def test_semaphore_released_after_error(self, client, admin_cookies):
+        """A request that errors inside the handler must release its semaphore slot.
+
+        Behavioral guarantee (stronger than a source inspection): after an
+        erroring request, the semaphore is back to its full permit count, so a
+        follow-up request isn't blocked. Exercises the ``finally`` release path.
+        """
+        try:
+            from backend import main as main_mod
+        except ModuleNotFoundError:
+            import main as main_mod
+
+        # Non-parquet ext raises 400 inside the try block (after acquiring a slot).
+        before = main_mod._metadata_semaphore._value
+        resp = client.get(
+            "/api/buckets/test-bucket/parquet-rows?key=data/test.csv",
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 400
+        after = main_mod._metadata_semaphore._value
+        assert before == after, (
+            f"semaphore leaked: {before} permits before, {after} after an error"
+        )
+
+
+# ── Tier 2: GET /api/buckets/{bucket}/parquet-stream ───────────────────────
+
+class TestParquetStreamEndpoint:
+    """Lifecycle + contract tests for the same-origin streaming proxy.
+
+    The endpoint pipes S3 bytes to the browser for duckdb-wasm so direct
+    browser→S3 ``fetch()`` (cross-origin / CORS-restricted on read-only buckets)
+    is avoided (arch §3). The load-bearing property is that the dedicated
+    ``_stream_semaphore`` permit is ALWAYS released — on 401/400/404/413, on
+    normal completion, and on a client disconnect mid-stream. These tests
+    exercise every one of those paths.
+    """
+
+    @staticmethod
+    def _import_main():
+        try:
+            from backend import main as main_mod
+        except ModuleNotFoundError:
+            import main as main_mod
+        return main_mod
+
+    @staticmethod
+    def _stream_fake_s3(data, content_length=None):
+        """Fake S3 whose ``get_object`` body supports ``iter_chunks(chunk_size)``
+        (the boto3 ``StreamingBody`` shape ``stream_object`` calls).
+
+        ``content_length`` is decoupled from ``len(data)`` so the size-cap test
+        can report a huge head_object without materializing a huge buffer.
+        Records ``get_calls`` so we can assert the body was / was not streamed.
+        """
+        import io as _io
+
+        class _Body:
+            """Mimics botocore's StreamingBody for the iter_chunks path only."""
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def iter_chunks(self, chunk_size):
+                for i in range(0, len(self._payload), chunk_size):
+                    yield self._payload[i:i + chunk_size]
+
+            def read(self):  # pragma: no cover — stream_object never calls read()
+                return self._payload
+
+        cl = content_length if content_length is not None else len(data)
+        body_holder = {"body": None}
+
+        class _FakeS3:
+            get_calls = 0
+
+            def head_object(self_, *, Bucket, Key):
+                return {"ContentLength": cl}
+
+            def get_object(self_, *, Bucket, Key, Range=None):
+                self_.get_calls += 1
+                body_holder["body"] = _Body(data)
+                return {"Body": body_holder["body"]}
+
+        return _FakeS3()
+
+    @staticmethod
+    def _sample_stream_bytes():
+        # ~205 KB so the default 64 KiB chunk size produces multiple chunks —
+        # proves the endpoint never buffers the whole object into memory at once.
+        return b"PAR1" + (bytes(range(256)) * 800) + b"PAR1"
+
+    def test_requires_auth(self, app):
+        """No auth cookie → 401, and S3 is never touched.
+
+        Uses a fresh ``TestClient`` so cookies persisted by earlier tests on the
+        shared module-scoped client don't leak in (mirrors parquet-rows).
+        """
+        with TestClient(app) as fresh:
+            resp = fresh.get(
+                "/api/buckets/test-bucket/parquet-stream?key=data/test.parquet"
+            )
+        assert resp.status_code == 401
+
+    def test_not_found_key_returns_404_and_releases_slot(
+        self, client, admin_cookies
+    ):
+        """A missing object → 404 from head_object, body never streamed, slot released."""
+        from unittest.mock import patch
+        from botocore.exceptions import ClientError as _CE
+
+        main_mod = self._import_main()
+        not_found = _CE(
+            {"Error": {"Code": "NoSuchKey", "Message": "Not Found"}}, "HeadObject"
+        )
+
+        class _MissingS3:
+            def head_object(self, *, Bucket, Key):
+                raise not_found
+
+            def get_object(self, *, Bucket, Key, Range=None):  # pragma: no cover
+                raise AssertionError("body GET must not happen on a missing object")
+
+        before = main_mod._stream_semaphore._value
+        with patch.object(main_mod, "s3", _MissingS3()):
+            resp = client.get(
+                "/api/buckets/test-bucket/parquet-stream?key=data/missing.parquet",
+                cookies=admin_cookies,
+            )
+        assert resp.status_code == 404, resp.text
+        assert resp.json()["detail"] == "Object not found"
+        # Critical: the slot acquired for head_object must be returned even on
+        # the error path (the generator never ran to release it for us).
+        assert main_mod._stream_semaphore._value == before, (
+            f"semaphore leaked on 404: {before} → {main_mod._stream_semaphore._value}"
+        )
+
+    def test_size_cap_returns_413_and_releases_slot(
+        self, client, admin_cookies
+    ):
+        """ContentLength > PARQUET_STREAM_CAP → 413, body never streamed, slot released."""
+        from unittest.mock import patch
+
+        main_mod = self._import_main()
+        huge = 200 * 1024 * 1024  # well above the 128 MB cap
+        fake = self._stream_fake_s3(b"PAR1smallpayload", content_length=huge)
+
+        before = main_mod._stream_semaphore._value
+        with patch.object(main_mod, "s3", fake):
+            resp = client.get(
+                "/api/buckets/test-bucket/parquet-stream?key=data/big.parquet",
+                cookies=admin_cookies,
+            )
+        assert resp.status_code == 413, resp.text
+        assert "128MB" in resp.json()["detail"]
+        # The whole point of the cap: never start streaming a too-large object.
+        assert fake.get_calls == 0, "body must not be streamed when over the cap"
+        assert main_mod._stream_semaphore._value == before, (
+            f"semaphore leaked on 413: {before} → {main_mod._stream_semaphore._value}"
+        )
+
+    def test_happy_path_streams_exact_bytes_and_headers(
+        self, client, admin_cookies
+    ):
+        """Small stream: concatenated body equals the object's bytes, headers correct."""
+        from unittest.mock import patch
+
+        main_mod = self._import_main()
+        data = self._sample_stream_bytes()
+        fake = self._stream_fake_s3(data)
+
+        before = main_mod._stream_semaphore._value
+        with patch.object(main_mod, "s3", fake):
+            resp = client.get(
+                "/api/buckets/test-bucket/parquet-stream?key=data/test.parquet",
+                cookies=admin_cookies,
+            )
+        assert resp.status_code == 200, resp.text
+        # Byte-fidelity: the streamed body reconstructs the object exactly.
+        assert resp.content == data
+        # Exactly one get_object (the endpoint must not re-fetch or buffer in a loop).
+        assert fake.get_calls == 1
+        # Headers (Content-Length from head_object, inline disposition, no caching).
+        assert resp.headers["content-length"] == str(len(data))
+        assert resp.headers["content-type"] == "application/octet-stream"
+        assert resp.headers["content-disposition"] == 'inline; filename="test.parquet"'
+        assert resp.headers["cache-control"] == "no-store"
+        # Normal completion releases the slot.
+        assert main_mod._stream_semaphore._value == before
+
+    def test_client_disconnect_releases_slot(self):
+        """A client disconnecting mid-stream MUST release the semaphore.
+
+        This is the highest-priority correctness property: we pull one chunk
+        from the real ``StreamingResponse.body_iterator`` (the same async
+        iterator Starlette drives), then ``aclose()`` it — exactly what Starlette
+        does when the downstream connection drops. The generator's ``finally``
+        runs on the resulting ``GeneratorExit`` and must return the permit.
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        main_mod = self._import_main()
+        data = self._sample_stream_bytes()
+        fake = self._stream_fake_s3(data)
+
+        async def drive():
+            before = main_mod._stream_semaphore._value
+            # NOTE: the patch context must stay open for the WHOLE iteration —
+            # the generator runs in a worker thread and resolves ``s3`` from
+            # module globals lazily, on each chunk.
+            with patch.object(main_mod, "s3", fake):
+                resp = main_mod.parquet_stream(
+                    "test-bucket",
+                    "data/test.parquet",
+                    user={"username": "admin", "role": "admin"},
+                )
+                # Slot acquired synchronously by the time parquet_stream returns.
+                assert main_mod._stream_semaphore._value == before - 1
+                it = resp.body_iterator
+                first = await it.__anext__()  # start streaming
+                assert first, "expected at least one chunk"
+                # Still held while the stream is in flight.
+                assert main_mod._stream_semaphore._value == before - 1
+                await it.aclose()  # ← simulate client disconnect
+            # The decisive assertion: permit returned despite the early close.
+            assert main_mod._stream_semaphore._value == before, (
+                f"semaphore leaked on disconnect: {before} → "
+                f"{main_mod._stream_semaphore._value}"
+            )
+
+        asyncio.run(drive())
+
+    def test_non_parquet_ext_returns_400_and_releases_slot(
+        self, client, admin_cookies
+    ):
+        """A non-Parquet key → 400 before head_object, slot released."""
+        main_mod = self._import_main()
+        before = main_mod._stream_semaphore._value
+        resp = client.get(
+            "/api/buckets/test-bucket/parquet-stream?key=data/test.csv",
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 400, resp.text
+        assert "Unsupported file type" in resp.json()["detail"]
+        assert main_mod._stream_semaphore._value == before, (
+            f"semaphore leaked on 400: {before} → {main_mod._stream_semaphore._value}"
+        )
+
+    def test_consumes_dedicated_stream_semaphore(self, client, admin_cookies):
+        """The stream endpoint is bounded by a DEDICATED ``_stream_semaphore(2)``,
+        NOT the shared ``_metadata_semaphore`` (arch §2 constraint #5 escape
+        hatch). Pre-acquire 1 of the 2 stream permits; a stream must still
+        succeed with the 1 remaining slot AND must NOT touch the metadata gate
+        at all. Pre-acquiring BOTH stream permits must 429 the next request.
+        """
+        from unittest.mock import patch
+
+        main_mod = self._import_main()
+        data = self._sample_stream_bytes()
+        fake = self._stream_fake_s3(data)
+        stream_sem = main_mod._stream_semaphore
+        meta_sem = main_mod._metadata_semaphore
+
+        # The suite must leave both semaphores fully available between tests.
+        assert stream_sem._value == 2, (
+            f"stream semaphore not at 2 at test start: {stream_sem._value}"
+        )
+        assert meta_sem._value == 4, (
+            f"metadata semaphore not at 4 at test start: {meta_sem._value}"
+        )
+
+        # ── Part 1: pre-acquire 1 of 2 stream permits; request still succeeds. ──
+        held = []
+        got = stream_sem.acquire(blocking=False)
+        assert got, "failed to pre-acquire a stream permit"
+        held.append(got)
+        try:
+            assert stream_sem._value == 1  # exactly one stream slot left
+            meta_before = meta_sem._value
+            with patch.object(main_mod, "s3", fake):
+                resp = client.get(
+                    "/api/buckets/test-bucket/parquet-stream?key=data/test.parquet",
+                    cookies=admin_cookies,
+                )
+            assert resp.status_code == 200, resp.text
+            assert resp.content == data
+            # The decisive isolation assertion: the metadata gate is UNTOUCHED.
+            assert meta_sem._value == meta_before, (
+                f"stream request touched the metadata gate: "
+                f"{meta_before} → {meta_sem._value}"
+            )
+            # After the request, only our 1 manual permit is outstanding.
+            assert stream_sem._value == 1
+        finally:
+            for _ in held:
+                stream_sem.release()
+            held.clear()
+        assert stream_sem._value == 2
+        assert meta_sem._value == 4
+
+        # ── Part 2: pre-acquire BOTH stream permits → next request gets 429. ──
+        # Fresh fake so get_calls starts at 0 (Part 1 already consumed one).
+        fake = self._stream_fake_s3(data)
+        for _ in range(2):
+            got = stream_sem.acquire(blocking=False)
+            assert got, "failed to pre-acquire a stream permit"
+            held.append(got)
+        try:
+            assert stream_sem._value == 0  # no stream slots left
+            meta_before = meta_sem._value
+            with patch.object(main_mod, "s3", fake):
+                resp = client.get(
+                    "/api/buckets/test-bucket/parquet-stream?key=data/test.parquet",
+                    cookies=admin_cookies,
+                )
+            assert resp.status_code == 429, resp.text
+            assert "concurrent stream" in resp.json()["detail"].lower()
+            # The 429 path (raised by _acquire_stream_slot) must not touch the
+            # metadata gate either, and must not leak a stream permit.
+            assert meta_sem._value == meta_before
+            assert stream_sem._value == 0
+            # body never streamed on a capacity 429.
+            assert fake.get_calls == 0
+        finally:
+            for _ in held:
+                stream_sem.release()
+            held.clear()
+        # Fully restored.
+        assert stream_sem._value == 2
+        assert meta_sem._value == 4
+
+    def test_missing_content_length_refuses_stream(
+        self, client, admin_cookies
+    ):
+        """head_object omitting ``ContentLength`` → 413, never streamed, slot released.
+
+        Without ContentLength the size cap is silently bypassed and we'd
+        advertise ``Content-Length: 0`` while real bytes stream. Real S3/MinIO
+        always return it, but close the hole: refuse to stream blind.
+        """
+        from unittest.mock import patch
+
+        main_mod = self._import_main()
+
+        class _NoLengthS3:
+            def head_object(self, *, Bucket, Key):
+                # Deliberately omits ContentLength.
+                return {"LastModified": "ignored"}
+
+            def get_object(self, *, Bucket, Key, Range=None):  # pragma: no cover
+                raise AssertionError("body must not be streamed when size is unknown")
+
+        before = main_mod._stream_semaphore._value
+        fake = _NoLengthS3()
+        with patch.object(main_mod, "s3", fake):
+            resp = client.get(
+                "/api/buckets/test-bucket/parquet-stream?key=data/unknown.parquet",
+                cookies=admin_cookies,
+            )
+        assert resp.status_code == 413, resp.text
+        assert "size" in resp.json()["detail"].lower()
+        # Slot released on the error path (generator never ran).
+        assert main_mod._stream_semaphore._value == before, (
+            f"semaphore leaked on missing ContentLength: {before} → "
+            f"{main_mod._stream_semaphore._value}"
+        )
+
+    def test_zero_byte_object_streams_and_releases(
+        self, client, admin_cookies
+    ):
+        """A 0-byte Parquet object streams 200 with an empty body and releases the slot.
+
+        ``ContentLength=0`` is a real (valid) value and must NOT trip the
+        missing-size guard (that guard only fires when the key is ABSENT). The
+        empty body still drives the generator to normal completion → ``finally``
+        releases the slot.
+        """
+        from unittest.mock import patch
+
+        main_mod = self._import_main()
+        fake = self._stream_fake_s3(b"", content_length=0)
+
+        before = main_mod._stream_semaphore._value
+        with patch.object(main_mod, "s3", fake):
+            resp = client.get(
+                "/api/buckets/test-bucket/parquet-stream?key=data/empty.parquet",
+                cookies=admin_cookies,
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.content == b""
+        assert resp.headers["content-length"] == "0"
+        # get_object still called once (the generator runs to completion).
+        assert fake.get_calls == 1
+        # Normal completion releases the slot.
+        assert main_mod._stream_semaphore._value == before, (
+            f"semaphore leaked on 0-byte stream: {before} → "
+            f"{main_mod._stream_semaphore._value}"
+        )
+
+    def test_mid_stream_clienterror_releases_slot(self):
+        """A ``ClientError`` from ``get_object`` once the generator starts MUST
+        release the stream slot — the generator's ``finally`` runs on the
+        propagating exception exactly as it does on a client disconnect.
+        """
+        import asyncio
+        from unittest.mock import patch
+        from botocore.exceptions import ClientError as _CE
+
+        main_mod = self._import_main()
+        denied = _CE(
+            {"Error": {"Code": "AccessDenied", "Message": "Access Denied"}},
+            "GetObject",
+        )
+
+        class _GetFailsS3:
+            def head_object(self, *, Bucket, Key):
+                return {"ContentLength": 1234}  # passes the size guard
+
+            def get_object(self, *, Bucket, Key, Range=None):
+                raise denied
+
+        async def drive():
+            before = main_mod._stream_semaphore._value
+            with patch.object(main_mod, "s3", _GetFailsS3()):
+                resp = main_mod.parquet_stream(
+                    "test-bucket",
+                    "data/test.parquet",
+                    user={"username": "admin", "role": "admin"},
+                )
+                # Slot acquired synchronously by the time parquet_stream returns.
+                assert main_mod._stream_semaphore._value == before - 1
+                it = resp.body_iterator
+                with pytest.raises(_CE):
+                    await it.__anext__()  # get_object raises here
+            # The decisive assertion: permit returned despite the mid-stream error.
+            assert main_mod._stream_semaphore._value == before, (
+                f"semaphore leaked on mid-stream ClientError: {before} → "
+                f"{main_mod._stream_semaphore._value}"
+            )
+
+        asyncio.run(drive())

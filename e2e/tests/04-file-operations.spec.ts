@@ -181,13 +181,16 @@ test.describe('File Operations', () => {
     const parquetRow = page.locator(`${SEL.tableRow}:has-text("sample.parquet")`).first();
     if (await parquetRow.isVisible().catch(() => false)) {
       await parquetRow.locator(`${SEL.colActions} button`).first().click();
-      await expect(page.locator(SEL.modal)).toBeVisible();
-      // Schema preview should show
       await expect(page.locator(`${SEL.modal} ${SEL.schemaPreview}`)).toBeVisible({ timeout: 10_000 });
       // Schema table with columns (may have multiple tables — column schema + stats)
       await expect(page.locator(`${SEL.modal} ${SEL.schemaTable}`).first()).toBeVisible();
       // Badge showing format
       await expect(page.locator(`${SEL.modal} ${SEL.schemaBadge}`)).toBeVisible();
+
+      // Switch to the Data tab — actual rows should render in the preview table.
+      await page.locator(`${SEL.modal} ${SEL.dataTab}`).click();
+      await expect(page.locator(`${SEL.modal} ${SEL.previewCsvTable} tbody tr`).first()).toBeVisible({ timeout: 10_000 });
+
       await page.locator(SEL.modalDismissButton).click();
     }
   });
@@ -223,5 +226,47 @@ test.describe('File Operations', () => {
     // Upload modal should open with the dropped file
     await expect(page.locator(SEL.modal)).toBeVisible({ timeout: 5_000 });
     await page.locator(SEL.uploadCancelButton).click();
+  });
+
+  // 4.12 SQL-tab smoke test — the ONE e2e test that exercises real duckdb-wasm
+  // (Tier 2). Everything else mocks the engine. See docs/architecture/
+  // parquet-content-preview.md §3 (Tier 2). The ~34MB WASM downloads + compiles
+  // on first SQL-tab open, which is slow under headless Chromium, so WASM-gated
+  // steps use a 60s timeout. The suite must NOT hard-fail if sample.parquet is
+  // missing or the WASM load is flaky in CI: every step is guarded with
+  // isVisible().catch(() => false) and the test returns early (skips) when the
+  // SQL tab isn't reachable. The SQL tab is only shown for files ≤ 128MB.
+  test('4.12 runs ad-hoc SQL against Parquet via duckdb-wasm (SQL tab)', async ({ page }) => {
+    const parquetRow = page.locator(`${SEL.tableRow}:has-text("sample.parquet")`).first();
+    if (!(await parquetRow.isVisible().catch(() => false))) return;
+
+    await parquetRow.locator(`${SEL.colActions} button`).first().click();
+    await expect(page.locator(SEL.modal)).toBeVisible();
+
+    // SQL tab is only rendered for files ≤ PARQUET_STREAM_CAP (128MB). If it's
+    // absent (oversize file, or sample missing), skip cleanly rather than fail.
+    const sqlTab = page.locator(`${SEL.modal} ${SEL.sqlTab}`);
+    if (!(await sqlTab.isVisible().catch(() => false))) {
+      await page.locator(SEL.modalDismissButton).click();
+      return;
+    }
+    await sqlTab.click();
+
+    // Wait for the editor to mount (engine boot: fetch bytes → instantiate
+    // WASM → register view). The Run button is disabled until 'ready'.
+    const runBtn = page.locator(`${SEL.modal} button:has-text("Run")`);
+    await expect(runBtn).toBeEnabled({ timeout: 60_000 });
+
+    // Run the default prefilled query (SELECT * FROM t LIMIT 100;) — but don't
+    // assume the default is present; type one explicitly to be robust.
+    const editor = page.locator(`${SEL.modal} textarea[aria-label="SQL editor"]`);
+    await editor.fill('SELECT * FROM t LIMIT 100;');
+    await runBtn.click();
+
+    // A result row should appear in the preview table. Real WASM is slow → 60s.
+    await expect(page.locator(`${SEL.modal} ${SEL.previewCsvTable} tbody tr`).first())
+      .toBeVisible({ timeout: 60_000 });
+
+    await page.locator(SEL.modalDismissButton).click();
   });
 });

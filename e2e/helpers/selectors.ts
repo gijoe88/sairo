@@ -258,6 +258,10 @@ export const SEL = {
   schemaPreview: '.schema-preview',
   schemaTable: '.schema-table',
   schemaBadge: '.schema-badge',
+  schemaTab: '[data-testid="schema-tab"]',
+  dataTab: '[data-testid="data-tab"]',
+  sqlTab: '[data-testid="sql-tab"]',
+  previewCsvTable: '.preview-csv-table',
 
   // ── Sort columns ──
   sortableColSize: '.th.col-size.sortable',

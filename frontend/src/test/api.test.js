@@ -1,8 +1,8 @@
 /**
  * Tests for api.js utility functions.
  */
-import { describe, it, expect } from "vitest";
-import { formatSize, formatDate } from "../api";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { formatSize, formatDate, streamParquetBytes } from "../api";
 
 describe("formatSize", () => {
   it("formats 0 bytes", () => {
@@ -48,5 +48,36 @@ describe("formatDate", () => {
     const result = formatDate("2024-01-15T10:30:00Z");
     expect(result).toBeTruthy();
     expect(result).not.toBe("—");
+  });
+});
+
+describe("streamParquetBytes", () => {
+  beforeEach(() => {
+    global.fetch = vi.fn();
+  });
+
+  it("hits /parquet-stream?key=… and returns the Response", async () => {
+    const fakeRes = { ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(4) };
+    global.fetch.mockResolvedValueOnce(fakeRes);
+
+    const res = await streamParquetBytes("mybucket", "path/to/file.parquet");
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    const [url] = global.fetch.mock.calls[0];
+    // Same-origin, bucket-scoped, key round-trips through URLSearchParams.
+    expect(url).toBe("/api/buckets/mybucket/parquet-stream?key=path%2Fto%2Ffile.parquet");
+    // The raw Response is handed back so the caller can arrayBuffer() it.
+    expect(res).toBe(fakeRes);
+  });
+
+  it("throws when the stream fails (non-ok status)", async () => {
+    // apiFetch throws for non-ok responses before streamParquetBytes ever sees
+    // the Response, so the rejection propagates with the status in the message.
+    global.fetch.mockResolvedValueOnce({
+      ok: false,
+      status: 413,
+      clone: () => ({ json: async () => ({}) }),
+    });
+    await expect(streamParquetBytes("b", "k")).rejects.toThrow(/413/);
   });
 });

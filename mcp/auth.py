@@ -102,7 +102,9 @@ class AuthManager:
         # Fetch bucket permissions for non-admin users
         permissions = {}
         if role != "admin":
-            permissions = await self._client.get_user_permissions(username)
+            permissions = await self._client.get_user_permissions(
+                username, user_token=token
+            )
 
         session = UserSession(
             username=username,
