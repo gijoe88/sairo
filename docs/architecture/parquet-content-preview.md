@@ -220,9 +220,32 @@ Notes:
 - `parquet-rows` reads `limit` then slices in-process for `offset` only for the
   small-file path; for the large-file path, `offset` beyond the first row groups
   is not supported in v1 (return `truncated: true`, UI disables “next page”).
-- Backend row serialization: convert pyarrow `Table` → Python via `.to_pylist()`
-  / `.to_pandas().values.tolist()`; cap cell size (e.g. truncate strings/blobs
-  > 4 KB) and serialize `datetime`/`decimal`/`bytes` explicitly to JSON.
+- Backend row serialization: **guard `to_pylist()` against temporal
+  `OverflowError`** (see §8 risk #3). The chosen approach is a **fast path with
+  per-column fallback**, not an upfront cast:
+  1. Try `table.to_pylist()` first — byte-identical to the original behavior for
+     the overwhelmingly common all-in-range case.
+  2. On `OverflowError` / `ArrowInvalid` (an out-of-range timestamp/date/etc.),
+     resolve **each column independently**: in-range temporal columns keep the
+     normal `datetime` → `_serialize_cell` → ISO path; only the overflowing
+     column(s) are cast via `pyarrow.compute.cast(col, pa.string())` (with a
+     `pa.int64()` fallback if string cast is unsupported for that subtype).
+  3. The whole decode region (slice + decode + cast + row-build) is wrapped so
+     any residual edge case returns a **structured 400**, never a bare 500.
+  **Why not an upfront cast of all temporal columns?** pyarrow's
+  `timestamp → string` formats as `"2024-01-01 00:00:00.000000"` (space +
+  fractional), whereas the in-range path yields ISO `"2024-01-01T12:00:00"`.
+  Upfront/whole-table casting would reformat *every* timestamp — a
+  frontend-affecting regression — and even casting only on overflow would
+  reformat the in-range *siblings* of an overflowing column. Per-column
+  resolution preserves ISO for in-range values while recovering only the
+  actually-overflowing data. Out-of-range cells render as pyarrow's placeholder
+  string (e.g. `"<value out of range: …>"`). Nested temporal types (struct/list
+  containing an out-of-range timestamp) are not recovered as data and degrade to
+  the structured 400 (recovering them would require recursing into nested
+  types — out of scope for the availability fix). Cap cell size separately
+  (truncate strings/blobs > 4 KB); `decimal`/`bytes`/nested types are handled by
+  the `_serialize_cell` per-cell hook.
 
 ## 6. Technology choices & trade-offs
 
@@ -261,8 +284,20 @@ Notes:
 2. **[MEDIUM] Large-file targeted-range assembler correctness.** Building a
    valid partial Parquet buffer from selected column chunks is fiddly. v1 ships
    the small-file path; large-file is gated behind v1.1 with its own tests.
-3. **[LOW] Complex/nested Parquet types** (lists, structs, maps). Serialize to
-   JSON strings; tests must cover at least one nested-type fixture.
+3. **[was a production bug — FIXED] Temporal/complex Parquet types.** A blanket
+   `table.to_pylist()` raises `OverflowError: date value out of range` inside
+   pyarrow's `TimestampScalar.as_py()` for any timestamp outside Python's
+   `datetime` range (year 1–9999), and this fires *before* any per-cell
+   serializer (e.g. `_serialize_cell`) can intervene — so the designed safety
+   net was bypassed and the endpoint returned a bare 500. **Fix (implemented on
+   `fix/parquet-timestamp-overflow`):** fast-path `to_pylist()`; on overflow,
+   resolve **per-column** (cast only the overflowing temporal column to string,
+   `int64` fallback), and wrap the decode region to return a structured 400
+   rather than 500. See the §5 serialization note for why this is per-column
+   rather than an upfront cast (format preservation). Tests must include an
+   out-of-range timestamp fixture (year > 9999) **and** a mixed-column case
+   (in-range + out-of-range siblings) — the original nested-type fixtures only
+   used in-range values and missed both.
 4. **[LOW] ORC/Avro content** — out of scope for this design; Tier 1 footer
    readers already exist, content rows could reuse the same UI later.
 
