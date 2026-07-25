@@ -16,6 +16,8 @@ import io
 import json
 import struct
 
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from botocore.exceptions import ClientError
 from fastapi import HTTPException
@@ -305,14 +307,66 @@ def read_parquet_rows(client, bucket, key, *, limit, offset, columns=None):
         raise HTTPException(400, f"Failed to read Parquet rows: {e}")
 
     # v1 applies offset in-process. pyarrow's Table.slice clamps gracefully
-    # when offset ≥ num_rows (returns an empty table).
-    table = table.slice(offset, limit)
-    records = table.to_pylist()
+    # when offset ≥ num_rows (returns an empty table). The whole decode region
+    # (slice + fast path + per-column fallback + row building) is wrapped so no
+    # Arrow/materialization error can escape as a bare 500 — a malformed file
+    # (incl. out-of-range temporals) yields a structured 400 instead.
+    try:
+        # Slice to the requested window BEFORE decoding so the per-column
+        # fallback below only touches the rows we actually return
+        # (≤ limit ≤ 1000).
+        table = table.slice(offset, limit)
 
-    rows = [
-        [_serialize_cell(rec[name]) for name in requested]
-        for rec in records
-    ]
+        # FAST PATH — no overflow anywhere. Byte-identical to the original
+        # behavior, so the overwhelmingly common case (all temporal values in
+        # range) is unchanged. Temporal cells materialize as Python
+        # datetime/date/time, which _serialize_cell renders as ISO 8601 with a
+        # 'T' separator (e.g. '2024-01-01T12:00:00').
+        try:
+            records = table.to_pylist()
+            rows = [
+                [_serialize_cell(rec[name]) for name in requested]
+                for rec in records
+            ]
+        except (OverflowError, pa.lib.ArrowInvalid, pa.lib.ArrowNotImplementedError):
+            # Some temporal value is out of Python's datetime range. Resolve
+            # EACH column independently so in-range temporal columns keep their
+            # ISO format (they still take the datetime → _serialize_cell path,
+            # byte-identical to the fast path) and only the columns that
+            # actually overflow get cast to string. This avoids the regression
+            # where a single overflowing sibling would force a whole-table cast
+            # and re-render in-range timestamps as
+            # 'YYYY-MM-DD HH:MM:SS.ffffff' (pyarrow's timestamp→string format).
+            col_values = []  # parallel to `requested`; each is a list of py scalars
+            for name in requested:
+                col = table.column(name)
+                try:
+                    col_values.append(col.to_pylist())
+                except (OverflowError, pa.lib.ArrowInvalid, pa.lib.ArrowNotImplementedError):
+                    # This column overflowed as datetime → cast to string so it
+                    # can't raise. pyarrow renders out-of-range temporals as a
+                    # '<value out of range: N>' placeholder.
+                    try:
+                        col_values.append(pc.cast(col, pa.string()).to_pylist())
+                    except (pa.lib.ArrowInvalid, pa.lib.ArrowNotImplementedError, TypeError):
+                        # int64 fallback for temporal subtypes pyarrow won't
+                        # cast to string. Defensive: in current pyarrow even
+                        # duration('s') casts to string, so this branch is
+                        # rarely hit — kept as spec-mandated coverage for any
+                        # subtype that regresses (or a future pyarrow version).
+                        col_values.append(pc.cast(col, pa.int64()).to_pylist())
+            n = len(col_values[0]) if col_values else 0
+            rows = [
+                [_serialize_cell(col_values[j][r]) for j in range(len(requested))]
+                for r in range(n)
+            ]
+    except Exception as e:
+        # Defensive: no decode error may ever escape as a bare 500. Nested-
+        # temporal overflows (struct/list/map containing an out-of-range
+        # timestamp) land here — the per-column string/int64 casts don't apply
+        # to nested temporal, so we don't try to recover them in this fix, but
+        # degrade to a structured 400 instead of crashing the preview.
+        raise HTTPException(400, f"Failed to decode Parquet rows: {e}")
 
     return {
         "columns": columns_out,

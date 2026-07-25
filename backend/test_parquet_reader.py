@@ -566,6 +566,178 @@ class TestReadParquetRows:
         assert exc.value.detail == "Object not found"
 
 
+class TestReadParquetRowsTemporalOverflow:
+    """Out-of-range temporal values must not crash the preview with a bare 500.
+
+    Regression guard: before the fix, ``table.to_pylist()`` raised
+    ``OverflowError`` when a timestamp/date/time/duration column held a value
+    outside Python's ``datetime`` range (e.g. year > 9999), surfacing as an
+    HTTP 500 from FastAPI. The fix catches that and falls back to casting the
+    temporal columns to string so the row is still returned.
+    """
+
+    def test_out_of_range_timestamp_returns_row_not_500(self):
+        """A timestamp(us) value beyond datetime.max is recovered, not dropped.
+
+        10**18 microseconds ≈ year 33688, well past ``datetime.max`` (~year
+        9999 ≈ 2.53e17 us). It fits in int64 so Parquet stores it fine, but
+        materializing it to a Python datetime overflows the OLD ``to_pylist()``
+        path (OverflowError "date value out of range" -> bare HTTP 500).
+
+        Fallback engaged: for this value ``pc.cast(col, pa.string())``
+        SUCCEEDS (pyarrow renders the placeholder
+        '<value out of range: 1000000000000000000>'), so the int64 fallback
+        does NOT fire here. The cell is therefore a ``str``, not an ``int``.
+        """
+        # 10**18 us ≈ year 33688 — beyond datetime.max. Built via int64 then
+        # cast to timestamp(us) so the value is genuinely stored out of range.
+        arr = pa.array([10**18], pa.int64()).cast(pa.timestamp("us"))
+        tbl = pa.table(
+            {"ts": arr},
+            schema=pa.schema([pa.field("ts", pa.timestamp("us"))]),
+        )
+        buf = io.BytesIO()
+        pq.write_table(tbl, buf)
+        fake = _RowsFakeS3(buf.getvalue())
+
+        # Must not raise (the old code raised OverflowError -> 500 here).
+        out = read_parquet_rows(fake, BUCKET, KEY, limit=10, offset=0)
+
+        # The row is present (NOT dropped) and the preview still completes.
+        assert out["read_mode"] == "full"
+        assert len(out["rows"]) == 1
+
+        # String cast path fired: the cell is a str holding pyarrow's
+        # out-of-range placeholder (which includes the raw micros value).
+        cell = out["rows"][0][0]
+        assert isinstance(cell, str)
+        assert cell == "<value out of range: 1000000000000000000>"
+
+    def test_in_range_timestamp_preserves_iso_format(self):
+        """A normal timestamp(us) takes the fast path: ISO 8601 format unchanged.
+
+        Locks the backward-compat requirement: the try-then-cast-fallback must
+        NOT alter the frontend-visible format for in-range files. The fast path
+        materializes a real ``datetime`` and ``_serialize_cell`` renders it as
+        '2024-01-01T12:00:00' ('T' separator, no fractionals). Casting upfront
+        would instead yield pyarrow's '2024-01-01 12:00:00.000000' (space +
+        trailing fractionals) — a regression this test pins out.
+        """
+        import datetime
+
+        tbl = pa.table(
+            {"ts": pa.array(
+                [datetime.datetime(2024, 1, 1, 12, 0, 0)],
+                pa.timestamp("us"),
+            )},
+            schema=pa.schema([pa.field("ts", pa.timestamp("us"))]),
+        )
+        buf = io.BytesIO()
+        pq.write_table(tbl, buf)
+        fake = _RowsFakeS3(buf.getvalue())
+
+        out = read_parquet_rows(fake, BUCKET, KEY, limit=10, offset=0)
+
+        assert out["read_mode"] == "full"
+        assert out["rows"][0][0] == "2024-01-01T12:00:00"
+
+    def test_mixed_in_range_and_out_of_range_columns_per_column_resolution(self):
+        """The regression the per-column fallback exists to prevent.
+
+        When a single table has BOTH an in-range timestamp column AND an
+        out-of-range timestamp column, the OLD whole-table cast fallback would
+        cast EVERY temporal column to string — re-rendering the in-range column
+        as pyarrow's '2024-01-01 00:00:00.000000' (space separator + trailing
+        fractionals) instead of the required ISO '2024-01-01T00:00:00'.
+
+        The per-column fix resolves each column independently: the in-range
+        column keeps its datetime → _serialize_cell → ISO path (byte-identical
+        to the fast path), and only the overflowing column gets cast to string.
+
+        This test MUST fail against a whole-table-cast implementation and pass
+        against the per-column implementation.
+        """
+        import datetime
+
+        # One row, two timestamp("us") columns: one in-range, one out-of-range.
+        # The out-of-range value is built via int64 → timestamp cast so it is
+        # genuinely stored beyond datetime.max (10**18 us ≈ year 33688).
+        in_range = pa.array(
+            [datetime.datetime(2024, 1, 1, 12, 0, 0)], pa.timestamp("us")
+        )
+        out_of_range = pa.array([10**18], pa.int64()).cast(pa.timestamp("us"))
+        tbl = pa.table(
+            {"good": in_range, "bad": out_of_range},
+            schema=pa.schema([
+                pa.field("good", pa.timestamp("us")),
+                pa.field("bad", pa.timestamp("us")),
+            ]),
+        )
+        buf = io.BytesIO()
+        pq.write_table(tbl, buf)
+        fake = _RowsFakeS3(buf.getvalue())
+
+        out = read_parquet_rows(fake, BUCKET, KEY, limit=10, offset=0)
+
+        # The row is present and the preview completes — no exception, no drop.
+        assert out["read_mode"] == "full"
+        assert len(out["rows"]) == 1
+
+        good_cell, bad_cell = out["rows"][0]
+
+        # THE REGRESSION GUARD: the in-range column keeps ISO format even though
+        # a sibling column overflowed. A whole-table cast would yield
+        # '2024-01-01 12:00:00.000000' here instead.
+        assert good_cell == "2024-01-01T12:00:00"
+
+        # The out-of-range column is still present (not dropped) and rendered as
+        # pyarrow's '<value out of range: N>' string placeholder.
+        assert isinstance(bad_cell, str)
+        assert bad_cell == "<value out of range: 1000000000000000000>"
+
+    def test_nested_temporal_overflow_returns_structured_400_not_500(self):
+        """A struct column holding an out-of-range timestamp degrades to 400.
+
+        The per-column string/int64 fallback only handles TOP-LEVEL temporal
+        columns; nested temporal (inside struct/list/map) can't be recovered by
+        a column cast. Such a file must NOT crash the preview as a bare 500 — it
+        must surface as a structured HTTPException(400) starting with the
+        'Failed to decode Parquet rows' prefix.
+
+        Construction note: building a struct whose child ts field holds an
+        out-of-range value is fiddly via ``pa.array`` (it rejects raw ints for a
+        timestamp field). The reliable path is to build the child timestamp
+        array from int64 (``pa.array([10**18], pa.int64()).cast(timestamp)``)
+        and assemble the struct with ``StructArray.from_arrays``.
+        """
+        # Child timestamp("us") array holding a genuinely out-of-range value
+        # (10**18 us ≈ year 33688, beyond datetime.max).
+        child = pa.array([10**18], pa.int64()).cast(pa.timestamp("us"))
+        struct_arr = pa.StructArray.from_arrays(
+            [child], fields=[pa.field("ts", pa.timestamp("us"))]
+        )
+        schema = pa.schema([
+            pa.field("s", pa.struct([pa.field("ts", pa.timestamp("us"))])),
+        ])
+        tbl = pa.table([struct_arr], schema=schema)
+        buf = io.BytesIO()
+        pq.write_table(tbl, buf)
+        fake = _RowsFakeS3(buf.getvalue())
+
+        # Trace under the fix: table.to_pylist() raises OverflowError (fast path
+        # miss) → per-column path runs table.column("s").to_pylist(), which also
+        # raises OverflowError → pc.cast(struct, string) raises
+        # ArrowNotImplementedError → caught → pc.cast(struct, int64) raises
+        # ArrowNotImplementedError, which is NOT caught by the inner string-cast
+        # handler → propagates to the outer `except Exception` → 400.
+        with pytest.raises(HTTPException) as exc:
+            read_parquet_rows(fake, BUCKET, KEY, limit=10, offset=0)
+
+        # Structured 400, NOT a bare OverflowError / 500.
+        assert exc.value.status_code == 400
+        assert exc.value.detail.startswith("Failed to decode Parquet rows")
+
+
 # ── Tier 2: stream_object (pure proxy source) ──────────────────────────────
 
 
