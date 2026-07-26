@@ -55,7 +55,7 @@ local branches:
 | PR | Branch (from `upstream-main`) | Contents |
 |----|-------------------------------|----------|
 | 1  | `fix/security-audit-v3.6.0`   | Subject A vulns **1, 2, 3, 4, 5, 7, 8, 9** (all backend/main.py). Atomic commits, one per finding. |
-| 2  | `fix/mcp-per-request-auth`    | Subject A vuln **6**. Isolated to `mcp/`. Separate PR because the transport integration is the highest-risk piece and deserves its own review. |
+| 2  | `fix/mcp-per-request-auth`    | Subject A vuln **6**. Isolated to `mcp/`. Separate PR because the transport integration is the highest-risk piece and deserves its own review. **⚠ Did NOT actually implement the fix** (merge `50e6fd3` carried the Parquet feature; `mcp/` byte-unchanged). Re-done as PR 6 on a fresh branch — see `audit-2026-07-fixes.md` §5. |
 | 3  | `feat/trusted-proxies-x-forwarded` | Subject B.Touches backend/main.py (middleware, audit log, config) — base on `upstream-main`, rebase after PR 1 lands if needed. |
 
 PR 1 and PR 3 both edit `backend/main.py`. Land PR 1 first; PR 3 rebases. PR 2 is independent and can proceed in parallel.
@@ -133,6 +133,8 @@ GitHub branch domain check (`:3735`) is `if OAUTH_ALLOWED_DOMAINS and domain and
 **Files:** `backend/main.py` (~3726-3736).
 
 ### A7. MCP per-request authentication — Vuln 6 (HIGH, conf 8) → PR 2
+
+> **⚠ STATUS (2026-07 whole-project re-audit): NOT IMPLEMENTED.** The merge `50e6fd3` "fix/mcp-per-request-auth" changed **zero lines** in `mcp/` (it carried the Parquet feature + a doc commit + one no-op prerequisite). Vuln 6 is **still live**: `/mcp` is unauthenticated, all tools run as a single shared admin session, resources leak every bucket with no auth, and the anonymous-viewer fallback is still minted. The re-do design — which also **corrects two technical errors in the fix below** (the v1.x SDK exposes the *MCP* request object at `ctx.request_context.request`, not the Starlette `Request`, so per-request identity must go through a `ContextVar`; and it adds the spec-mandated `Origin` header validation) — plus an urgent `mcp>=1.28.0,<2` version pin is in **`docs/architecture/audit-2026-07-fixes.md` §3 + §4.1**. Read that doc, not this section, for the current A7 plan.
 
 `mcp/server.py:142` (`lifespan`) authenticates **once** at startup with `SAIRO_API_TOKEN` and stores a single shared `UserSession` in `lifespan_context["session"]`; every tool (`mcp/tools/*.py`) reuses it. No HTTP-level auth on the `/mcp` streamable-HTTP route (only `/metrics` has it). The documented Docker Quick Setup binds `0.0.0.0:8100`. Anyone reaching the port inherits admin.
 
