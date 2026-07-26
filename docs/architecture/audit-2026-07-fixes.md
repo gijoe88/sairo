@@ -132,6 +132,18 @@ With per-request sessions, every tool's `user=session.username` / `user_token=se
 
 **Files:** `mcp/requirements.txt`, `mcp/server.py`, new `mcp/session_ctx.py`, `mcp/auth.py`, `mcp/sairo_client.py` (no change — already forwards `user_token`), every `mcp/tools/*.py`, `mcp/resources/providers.py`, `mcp/tests/`. Docs correction (`website/.../mcp.mdx`: "every tool call is gated by authentication" is currently false until this lands; the "mint an admin token" guidance should become "least-privilege viewer by default") goes on **fork `main`**, not the PR branch.
 
+#### 4.1.8 Implementation outcome (PR 6 — `fix/mcp-per-request-auth-v2` @ `c37d7ac`, landed on origin 2026-07)
+
+**Spike (§4.1.7): PASSED on mcp 1.28.1.** Shape 1 confirmed — `streamable_http_app()` + `add_middleware` wraps `/mcp`; the ContextVar set in `BaseHTTPMiddleware` before `call_next` is visible in the tool coroutine; concurrent requests are isolated. The automated regression for this is `tests/test_per_request_auth.py` test T8 (load-bearing — see below).
+
+**Critical bug found & fixed during implementation (worth remembering for future SDK work):** the FastMCP `lifespan` runs **per-request** under `stateless_http=True`, and the bootstrap code was unconditionally re-binding the service/dev-admin session into the ContextVar on every request — **clobbering** the middleware's per-request caller session. Net effect over HTTP: every tool would still have run as admin, silently defeating the entire fix. Caught by the new HTTP-path test suite (the existing in-memory/stdio e2e tests couldn't see it); fixed by guarding the lifespan bind (`if session is not None and not has_session()`). Test T8 fails when the guard is reverted. **Lesson: per-request auth on FastMCP must be validated over the real HTTP transport, not only in-memory — the lifespan-per-request behavior is non-obvious.**
+
+**Deviation from design (acceptable, security-equivalent):** `resources/providers.py` uses **ContextVar-only** signatures (`async def storage_overview()` / `async def bucket_summary(bucket)`) instead of the designed `ctx: Context` parameter. Reason: on mcp 1.28.1 a *static-URI* resource (`objex://overview`) whose handler takes a `Context` param gets misrouted into the template branch at registration → "Unknown resource". Security outcome is identical — unauthenticated reads are blocked by the Bearer middleware; authenticated-but-unauthorized callers are per-bucket scoped via `current_session()`.
+
+**Operational follow-up (docs, on `main`):** `MCP_ALLOWED_ORIGINS` defaults to same-host. Behind a TLS-terminating proxy the app sees scheme `http` while the browser sends an `https` Origin → the same-host default would reject legitimate browser clients. Operators behind TLS proxies **must** set `MCP_ALLOWED_ORIGINS=https://<host>`. We deliberately do **not** honor unauthenticated `X-Forwarded-Proto` to fix this (per `AGENTS.md`) — `TRUSTED_PROXIES` only applies to the main backend, not the MCP server. This must be in the operator docs alongside the version-pin note.
+
+**Remaining on `main` (docs only, not in any PR):** (1) `website/.../mcp.mdx` corrections (the "every tool call is gated by authentication" claim and the "mint an admin token" → "least-privilege viewer by default" guidance); (2) operator note for `MCP_ALLOWED_ORIGINS` + TLS-proxy + the mcp version pin.
+
 ---
 
 ### 4.2 F2 — Reserved bucket-name namespace (`users.db` collision) — `backend/main.py`
@@ -254,6 +266,8 @@ Fork policy (also in `AGENTS.md`): every PR branch is cut from **`upstream-main`
 |----|-------------------------------|----------|------------|
 | 5  | `chore/mcp-pin-bump` | §3: `mcp[cli]>=1.28.0,<2`. Tiny, urgent, lands before 2026-07-28. | — |
 | 6  | `fix/mcp-per-request-auth-v2` | F1 (the A7 re-do). Isolated to `mcp/`. Highest-risk; own review. | PR 5 (so the spike + tests run on 1.28.1) |
+
+> **Status (2026-07):** PR 5 pushed `origin/chore/mcp-pin-bump` @ `e6fcb6e` (code-only, 1 line, tests green on 1.28.1). PR 6 pushed `origin/fix/mcp-per-request-auth-v2` @ `c37d7ac` (6 commits, code-only, `pytest mcp/` 111 passed/75 skipped; spike PASSED — see §4.1.8). Neither opened upstream yet — `gh` unavailable in agent sessions; opening via the GitHub compare UI is queued for the user. PRs 7–10 not started.
 | 7  | `fix/bucket-db-namespace` | F2 (reserved-name/`bucket_` prefix + migration). | — (but coordinate with F3 if both touch `_db_path` lookups) |
 | 8  | `fix/endpoint-scoped-permissions` | F3 (`bucket_permissions.endpoint_id`). Backend + frontend UI. | — |
 | 9  | `fix/auth-mode-and-cookie-hardening` | F4 (login-s3 guard) + F7 (cookie DB check) + L1/L2/L3/L4/L5 (backend hardening bundle, minus L6/L7 which ride with F1). All small backend changes, ride together. | — |
