@@ -271,6 +271,23 @@ def _main_module():
     return m
 
 
+def _mint_s3_cookie(username):
+    """Construct an S3-mode session cookie directly. The login-s3 route issues
+    exactly this JWT (sub='s3:...', role='admin'); minting it here avoids the
+    shared login rate limiter (LOGIN_RATE_MAX=10 / 300s) that the route enforces
+    and keeps these guard tests isolated from the login path. The s3ak/s3sk
+    claims that the route also carries are only needed for live S3 calls, which
+    these endpoints don't make, so they're omitted. Mirrors F7's use of jwt."""
+    import jwt as _jwt
+    m = _main_module()
+    token = _jwt.encode(
+        {"sub": username, "role": "admin",
+         "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
+        m.JWT_SECRET, algorithm="HS256",
+    )
+    return {"access_token": token}
+
+
 class TestOIDC:
     """Generic OpenID Connect login (issue #9): username-only sync, admin perms."""
 
@@ -3041,3 +3058,429 @@ class TestBucketDbNamespace:
                     os.remove(db_file + ext)
                 except FileNotFoundError:
                     pass
+
+
+# ── PR 9: auth-mode guard, cookie/DB validation, 2FA entropy, OAuth state ────
+#
+# F4: /api/auth/login-s3 gated on AUTH_MODE=s3
+# F7: cookie sessions re-validated against the users table on each request
+# L4: 64-bit (16 hex) 2FA recovery codes
+# L5: oauth_state cookie cleared after the OAuth exchange (success + 2FA)
+
+
+def _cookie_deletion_set(headers, name: str, path: str) -> bool:
+    """True if the response carries a Set-Cookie header that *deletes* `name`
+    scoped to `path` (empty value + Max-Age=0). Used to assert that an auth
+    flow clears a state cookie."""
+    # httpx.Headers exposes multi-valued headers via get_list (not getlist).
+    get_all = getattr(headers, "get_list", None) or getattr(headers, "getlist", None)
+    for sc in (get_all("set-cookie") if get_all else []):
+        if sc.startswith(f"{name}=") and f"Path={path}" in sc and "Max-Age=0" in sc:
+            return True
+    return False
+
+
+class TestS3LoginModeGuard:
+    """F4: in local mode the S3 login route must be unreachable (it otherwise
+    hands a local-admin cookie to anyone holding the server's S3 service-account
+    credentials)."""
+
+    def test_login_s3_rejected_in_local_mode(self, client, monkeypatch):
+        m = _main_module()
+        monkeypatch.setattr(m, "AUTH_MODE", "local")
+        resp = client.post(
+            "/api/auth/login-s3",
+            json={"access_key": "AKIATEST123456", "secret_key": "secretkey1234"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 404
+
+    def test_login_s3_allowed_in_s3_mode(self, app, monkeypatch):
+        """In s3 mode the guard lets the request through; with boto3 mocked by
+        the app fixture, list_buckets() succeeds and a session is issued."""
+        m = _main_module()
+        monkeypatch.setattr(m, "AUTH_MODE", "s3")
+        with TestClient(app) as c:
+            resp = c.post(
+                "/api/auth/login-s3",
+                json={"access_key": "AKIATEST123456", "secret_key": "secretkey1234"},
+                follow_redirects=False,
+            )
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            assert data["username"].startswith("s3:")
+            assert data["role"] == "admin"
+            assert resp.cookies.get("access_token"), "session cookie should be issued"
+
+
+class TestCookieSessionDBValidation:
+    """F7: a cookie session is re-checked against the users table on every
+    request, so a deleted user fails immediately and a demoted admin's role
+    updates on the next request (mirrors the API-token path)."""
+
+    def test_deleted_user_cookie_is_rejected(self, app, client, admin_cookies):
+        m = _main_module()
+        # Idempotency: clear any leftover row from a prior warm run.
+        with m._get_users_db() as db:
+            db.execute("DELETE FROM users WHERE username=?", ("f7-deleted",))
+            db.commit()
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": "f7-deleted", "password": "pw12345678", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        with TestClient(app) as c:
+            login = c.post("/api/auth/login",
+                           json={"username": "f7-deleted", "password": "pw12345678"})
+            assert login.status_code == 200
+            cookie = {"access_token": login.cookies.get("access_token")}
+            # Cookie is honored while the user exists.
+            me = c.get("/api/auth/me", cookies=cookie)
+            assert me.status_code == 200
+            assert me.json()["username"] == "f7-deleted"
+            # Remove the user directly in the DB (cookie still has ~SESSION_HOURS left).
+            with m._get_users_db() as db:
+                db.execute("DELETE FROM users WHERE username=?", ("f7-deleted",))
+                db.commit()
+            # Same cookie must now be rejected — not honored until expiry.
+            me2 = c.get("/api/auth/me", cookies=cookie)
+            assert me2.status_code == 401
+
+    def test_demoted_admin_role_updates_and_admin_route_blocks(self, app, client, admin_cookies):
+        m = _main_module()
+        # Idempotency: clear any leftover row from a prior warm run.
+        with m._get_users_db() as db:
+            db.execute("DELETE FROM users WHERE username=?", ("f7-demoted",))
+            db.commit()
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": "f7-demoted", "password": "pw12345678", "role": "admin"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        with TestClient(app) as c:
+            login = c.post("/api/auth/login",
+                           json={"username": "f7-demoted", "password": "pw12345678"})
+            assert login.status_code == 200
+            cookie = {"access_token": login.cookies.get("access_token")}
+            # Initially admin — admin-gated route works.
+            me = c.get("/api/auth/me", cookies=cookie)
+            assert me.status_code == 200 and me.json()["role"] == "admin"
+            assert c.get("/api/health-detail", cookies=cookie).status_code == 200
+            # Demote to viewer directly in the DB.
+            with m._get_users_db() as db:
+                db.execute("UPDATE users SET role=? WHERE username=?",
+                           ("viewer", "f7-demoted"))
+                db.commit()
+            # Next request reflects the demotion (cookie still encodes 'admin').
+            me2 = c.get("/api/auth/me", cookies=cookie)
+            assert me2.status_code == 200
+            assert me2.json()["role"] == "viewer"
+            # And the admin-gated route now forbids the demoted session.
+            assert c.get("/api/health-detail", cookies=cookie).status_code == 403
+
+    def test_live_user_cookie_still_works(self, app, client, admin_cookies):
+        """Sanity: the DB check must not break a live, unmodified user's cookie."""
+        m = _main_module()
+        # Idempotency: clear any leftover row from a prior warm run.
+        with m._get_users_db() as db:
+            db.execute("DELETE FROM users WHERE username=?", ("f7-live",))
+            db.commit()
+        client.post(
+            "/api/auth/users",
+            json={"username": "f7-live", "password": "pw12345678", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        with TestClient(app) as c:
+            login = c.post("/api/auth/login",
+                           json={"username": "f7-live", "password": "pw12345678"})
+            assert login.status_code == 200
+            me = c.get("/api/auth/me",
+                       cookies={"access_token": login.cookies.get("access_token")})
+            assert me.status_code == 200
+            assert me.json()["role"] == "viewer"
+
+    def test_s3_session_cookie_not_subject_to_db_lookup(self, app, monkeypatch):
+        """F7 correctness refinement: an s3: session has no users row and must
+        bypass the DB lookup (else every S3 request would 401)."""
+        import jwt as _jwt
+        m = _main_module()
+        monkeypatch.setattr(m, "AUTH_MODE", "s3")
+        with TestClient(app) as c:
+            resp = c.post(
+                "/api/auth/login-s3",
+                json={"access_key": "AKIATESTS3MODE", "secret_key": "secretkey1234"},
+                follow_redirects=False,
+            )
+            assert resp.status_code == 200, resp.text
+            token = resp.cookies.get("access_token")
+            assert token
+            # No users row exists for 's3:AKIATEST...' — /me must still succeed.
+            me = c.get("/api/auth/me", cookies={"access_token": token})
+            assert me.status_code == 200
+            assert me.json()["username"].startswith("s3:")
+            assert me.json()["role"] == "admin"
+            # And the sub indeed carries the s3: prefix the exemption keys on.
+            claims = _jwt.decode(token, m.JWT_SECRET, algorithms=["HS256"])
+            assert claims["sub"].startswith("s3:")
+
+
+class TestTwoFactorRecoveryEntropy:
+    """L4: recovery codes must be 64-bit (16 hex chars), not 32-bit (8 hex)."""
+
+    def test_recovery_codes_are_16_hex_chars(self, app, client, admin_cookies):
+        import re
+        import pyotp
+        m = _main_module()
+        # Idempotency: clear any leftover row (incl. 2FA state columns carried on
+        # the users row) from a prior warm run so setup starts clean.
+        with m._get_users_db() as db:
+            db.execute("DELETE FROM users WHERE username=?", ("f7-2fa",))
+            db.commit()
+        # Use a dedicated user so the shared admin is not 2FA-locked for later tests.
+        client.post(
+            "/api/auth/users",
+            json={"username": "f7-2fa", "password": "pw12345678", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        with TestClient(app) as c:
+            assert c.post("/api/auth/login",
+                          json={"username": "f7-2fa", "password": "pw12345678"}).status_code == 200
+            secret = c.post("/api/auth/2fa/setup").json()["secret"]
+            code = pyotp.TOTP(secret).now()
+            resp = c.post("/api/auth/2fa/enable", json={"code": code})
+            assert resp.status_code == 200, resp.text
+            codes = resp.json()["recovery_codes"]
+            assert len(codes) == 10
+            hex16 = re.compile(r"^[0-9a-f]{16}$")
+            for value in codes:
+                assert hex16.match(value), f"recovery code not 16 hex chars: {value!r}"
+
+
+class TestOAuthStateCookieCleared:
+    """L5: the OAuth callback must clear the oauth_state cookie on both the
+    success and 2FA branches (mirrors the OIDC callback's oidc_state cleanup)."""
+
+    def _enable_google(self, monkeypatch):
+        m = _main_module()
+        monkeypatch.setattr(m, "OAUTH_GOOGLE_CLIENT_ID", "g-client-id")
+        monkeypatch.setattr(m, "OAUTH_GOOGLE_CLIENT_SECRET", "g-secret")
+        monkeypatch.setattr(m, "OAUTH_ALLOWED_DOMAINS", [])
+        return m
+
+    def _stub_google_userinfo(self, monkeypatch, email):
+        from types import SimpleNamespace
+        monkeypatch.setattr("httpx.post", lambda *a, **k: SimpleNamespace(
+            status_code=200, json=lambda: {"access_token": "AT"}))
+        monkeypatch.setattr("httpx.get", lambda *a, **k: SimpleNamespace(
+            status_code=200, json=lambda: {"email": email}))
+
+    def _handshake(self, c):
+        """Call oauth_start (Google) to obtain the signed oauth_state cookie +
+        the state param so the callback's A5 CSRF check passes. Mirrors the
+        _state_handshake pattern in TestOAuthAllowedDomains. Returns
+        (cookies_dict, state_value)."""
+        from urllib.parse import urlparse, parse_qs
+        start = c.get("/api/auth/oauth/google/login", follow_redirects=False)
+        cookie = start.cookies.get("oauth_state")
+        loc = start.headers["location"]
+        state = parse_qs(urlparse(loc).query)["state"][0]
+        return {"oauth_state": cookie}, state
+
+    def test_success_branch_deletes_oauth_state(self, app, monkeypatch):
+        m = self._enable_google(monkeypatch)
+        self._stub_google_userinfo(monkeypatch, "oauthuser@corp.test")
+        with TestClient(app) as c:
+            ck, st = self._handshake(c)
+            resp = c.get(f"/api/auth/oauth/google/callback?code=abc&state={st}",
+                         cookies=ck, follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert resp.headers["location"] == "/"
+            assert resp.cookies.get("access_token"), "session cookie should be issued"
+            assert _cookie_deletion_set(resp.headers, "oauth_state", "/api/auth/oauth")
+        # The synced OAuth user exists (username is the email local-part).
+        with m._get_users_db() as db:
+            row = db.execute("SELECT role, auth_source FROM users WHERE username=?",
+                             ("oauthuser",)).fetchone()
+            assert row is not None and row["role"] == "viewer"
+            assert (row["auth_source"] or "") == "oauth"
+
+    def test_2fa_branch_deletes_oauth_state(self, app, monkeypatch):
+        m = self._enable_google(monkeypatch)
+        # Pre-create an OAuth user with 2FA already enabled so the callback takes
+        # the 2FA branch (INSERT OR REPLACE keeps the test re-runnable in-process).
+        with m._get_users_db() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO users "
+                "(username, password_hash, role, auth_source, totp_enabled) "
+                "VALUES (?, ?, ?, ?, 1)",
+                ("oauth2fa", "OAUTH:placeholder", "viewer", "oauth"))
+            db.commit()
+        self._stub_google_userinfo(monkeypatch, "oauth2fa@corp.test")
+        with TestClient(app) as c:
+            ck, st = self._handshake(c)
+            resp = c.get(f"/api/auth/oauth/google/callback?code=abc&state={st}",
+                         cookies=ck, follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert "requires_2fa=true" in resp.headers["location"]
+            assert resp.cookies.get("access_token"), "pending 2FA cookie should be issued"
+            assert _cookie_deletion_set(resp.headers, "oauth_state", "/api/auth/oauth")
+
+
+# ── L1: S3-mode tenant scoping ───────────────────────────
+
+class TestS3ModeTenantScoping:
+    """L1: an S3-mode session (sub='s3:...', role='admin') passes require_admin,
+    so in a multi-tenant S3 deployment the share-link/token/audit/user endpoints
+    must be scoped or blocked to prevent one tenant reading another tenant's
+    data. Non-s3 admins keep full access (non-regression)."""
+
+    S3_USER = "s3:AKIAL100"   # mirrors login-s3's f"s3:{access_key[:8]}"
+
+    def test_s3_session_cannot_list_other_tenants_share_links(self, app, client, admin_cookies):
+        """S3 session sees only its own share_links; a local admin still sees all."""
+        m = _main_module()
+        s3_cookie = _mint_s3_cookie(self.S3_USER)
+        with TestClient(app) as c:
+            with m._get_users_db() as db:
+                db.execute("DELETE FROM share_links WHERE token LIKE 'l1sl-%'")
+                db.execute(
+                    "INSERT INTO share_links (token, bucket, key, created_by, expires_at) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1sl-alice", "alice-bkt", "alice.txt", "alice", "2030-01-01T00:00:00+00:00"))
+                db.execute(
+                    "INSERT INTO share_links (token, bucket, key, created_by, expires_at) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1sl-s3a", "s3-bkt", "a.txt", self.S3_USER, "2030-01-01T00:00:00+00:00"))
+                db.execute(
+                    "INSERT INTO share_links (token, bucket, key, created_by, expires_at) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1sl-s3b", "s3-bkt", "b.txt", self.S3_USER, "2030-01-01T00:00:00+00:00"))
+                db.commit()
+            # S3 session: only its own rows — alice's link must be absent.
+            resp = c.get("/api/share-links", cookies=s3_cookie)
+            assert resp.status_code == 200
+            owners = {l["created_by"] for l in resp.json()["links"]}
+            assert "alice" not in owners
+            assert self.S3_USER in owners
+        # Non-regression: a normal local admin still sees alice's link.
+        resp = client.get("/api/share-links", cookies=admin_cookies)
+        assert resp.status_code == 200
+        owners = {l["created_by"] for l in resp.json()["links"]}
+        assert "alice" in owners
+
+    def test_s3_session_cannot_delete_other_tenants_share_link(self, app):
+        """S3 session gets 403 deleting another tenant's link, 200 on its own."""
+        m = _main_module()
+        s3_cookie = _mint_s3_cookie(self.S3_USER)
+        with TestClient(app) as c:
+            with m._get_users_db() as db:
+                db.execute("DELETE FROM share_links WHERE token LIKE 'l1sd-%'")
+                db.execute(
+                    "INSERT INTO share_links (token, bucket, key, created_by, expires_at) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1sd-alice", "alice-bkt", "alice.txt", "alice", "2030-01-01T00:00:00+00:00"))
+                db.execute(
+                    "INSERT INTO share_links (token, bucket, key, created_by, expires_at) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1sd-s3", "s3-bkt", "own.txt", self.S3_USER, "2030-01-01T00:00:00+00:00"))
+                db.commit()
+                alice_id = db.execute(
+                    "SELECT id FROM share_links WHERE token='l1sd-alice'").fetchone()["id"]
+                own_id = db.execute(
+                    "SELECT id FROM share_links WHERE token='l1sd-s3'").fetchone()["id"]
+            # Cross-tenant delete -> 403, row survives.
+            resp = c.delete(f"/api/share-links/{alice_id}", cookies=s3_cookie)
+            assert resp.status_code == 403
+            with m._get_users_db() as db:
+                assert db.execute(
+                    "SELECT id FROM share_links WHERE id=?", (alice_id,)).fetchone() is not None
+            # Own delete -> 200.
+            resp = c.delete(f"/api/share-links/{own_id}", cookies=s3_cookie)
+            assert resp.status_code == 200
+
+    def test_s3_session_list_tokens_scoped_to_self(self, app, client, admin_cookies):
+        """S3 session's token list excludes other tenants; local admin sees all."""
+        m = _main_module()
+        s3_cookie = _mint_s3_cookie(self.S3_USER)
+        with TestClient(app) as c:
+            with m._get_users_db() as db:
+                db.execute("DELETE FROM api_tokens WHERE token_hash LIKE 'l1tl-%'")
+                db.execute(
+                    "INSERT INTO api_tokens (token_hash, token_prefix, username, name, role) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1tl-alice", "l1tl-alice...", "alice", "alice-tok", "admin"))
+                db.commit()
+            # S3 session: alice's token must be absent (s3 sessions mint none).
+            resp = c.get("/api/auth/tokens", cookies=s3_cookie)
+            assert resp.status_code == 200
+            owners = {t["username"] for t in resp.json()["tokens"]}
+            assert "alice" not in owners
+        # Non-regression: local admin still sees alice's token.
+        resp = client.get("/api/auth/tokens", cookies=admin_cookies)
+        assert resp.status_code == 200
+        owners = {t["username"] for t in resp.json()["tokens"]}
+        assert "alice" in owners
+
+    def test_s3_session_cannot_delete_other_tenants_token(self, app):
+        """S3 session gets 403 deleting another tenant's API token; row survives."""
+        m = _main_module()
+        s3_cookie = _mint_s3_cookie(self.S3_USER)
+        with TestClient(app) as c:
+            with m._get_users_db() as db:
+                db.execute("DELETE FROM api_tokens WHERE token_hash LIKE 'l1td-%'")
+                db.execute(
+                    "INSERT INTO api_tokens (token_hash, token_prefix, username, name, role) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1td-alice", "l1td-alice...", "alice", "alice-tok", "admin"))
+                db.commit()
+                alice_tok = db.execute(
+                    "SELECT id FROM api_tokens WHERE token_hash='l1td-alice'").fetchone()["id"]
+            resp = c.delete(f"/api/auth/tokens/{alice_tok}", cookies=s3_cookie)
+            assert resp.status_code == 403
+            with m._get_users_db() as db:
+                assert db.execute(
+                    "SELECT id FROM api_tokens WHERE id=?", (alice_tok,)).fetchone() is not None
+
+    def test_s3_session_blocked_from_audit_log(self, app, client, admin_cookies):
+        """S3 session gets 403 on the cross-tenant audit log; local admin reads it."""
+        m = _main_module()
+        s3_cookie = _mint_s3_cookie(self.S3_USER)
+        with TestClient(app) as c:
+            resp = c.get("/api/audit-log", cookies=s3_cookie)
+            assert resp.status_code == 403
+        # Non-regression: a normal local admin can still read the audit log.
+        assert client.get("/api/audit-log", cookies=admin_cookies).status_code == 200
+
+    def test_s3_session_blocked_from_user_list(self, app, client, admin_cookies):
+        """S3 session gets 403 on the cross-tenant user list; local admin reads it."""
+        m = _main_module()
+        s3_cookie = _mint_s3_cookie(self.S3_USER)
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/users", cookies=s3_cookie)
+            assert resp.status_code == 403
+        # Non-regression: a normal local admin can still list users.
+        assert client.get("/api/auth/users", cookies=admin_cookies).status_code == 200
+
+
+# ── L2: HSTS ─────────────────────────────────────────────
+
+class TestHSTS:
+    """L2: Strict-Transport-Security is advertised only when the request scheme
+    is https, so dev/localhost (http) isn't pinned."""
+
+    def test_hsts_present_on_https(self, app):
+        """An https request advertises HSTS with the exact expected value."""
+        with TestClient(app, base_url="https://testserver") as c:
+            resp = c.get("/api/branding")
+            assert resp.status_code == 200
+            assert resp.headers["Strict-Transport-Security"] == (
+                "max-age=31536000; includeSubDomains"
+            )
+
+    def test_hsts_absent_on_http(self, client):
+        """An http request must NOT pin HSTS (dev/localhost safety)."""
+        resp = client.get("/api/branding")
+        assert resp.status_code == 200
+        assert "Strict-Transport-Security" not in resp.headers

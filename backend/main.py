@@ -126,6 +126,13 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # L2: advertise HTTPS-only access only when the transport is actually HTTPS
+    # (direct-https deploys, or a proxy that sets the scheme). Absent on http so
+    # dev/localhost isn't pinned.
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
     return response
 
 
@@ -818,7 +825,23 @@ def get_current_user(request: Request):
         # Reject 2FA pending tokens for normal endpoints
         if payload.get("purpose") == "2fa":
             raise HTTPException(401, "2FA verification required")
-        return {"username": payload["sub"], "role": payload["role"]}
+        sub = payload["sub"]
+        if sub.startswith("s3:"):
+            # S3-key sessions are authenticated by their encrypted IAM credentials
+            # (see _extract_s3_session), NOT the users table — they have no row
+            # there, so a DB lookup must not run for them.
+            return {"username": sub, "role": payload["role"]}
+        # Local/LDAP/OAuth/OIDC sessions: the DB is authoritative for existence
+        # and role. A deleted user's cookie must fail immediately (not at
+        # SESSION_HOURS), and a demoted admin's role must update on the next
+        # request. This mirrors the API-token path (_verify_api_token JOINs
+        # users). One indexed PK lookup per request — cheap.
+        with _get_users_db() as db:
+            row = db.execute(
+                "SELECT role FROM users WHERE username=?", (sub,)).fetchone()
+        if not row:
+            raise HTTPException(401, "User no longer exists")
+        return {"username": sub, "role": row["role"]}
     except jwt.ExpiredSignatureError:
         raise HTTPException(401, "Session expired")
     except jwt.InvalidTokenError:
@@ -3079,6 +3102,8 @@ def auth_login_s3(req: LoginS3Request, request: Request):
     Calls list_buckets() with the provided access key / secret key.
     If it succeeds, the credentials are valid and the user gets an admin session.
     """
+    if AUTH_MODE != "s3":
+        raise HTTPException(404, "S3 login is not enabled")
     _check_login_rate(request.client.host)
     if not req.access_key or not req.secret_key:
         raise HTTPException(400, "Access key and secret key are required")
@@ -3185,6 +3210,10 @@ def auth_refresh(user: dict = Depends(get_current_user)):
 
 @app.get("/api/auth/users")
 def auth_list_users(user: dict = Depends(require_admin)):
+    # L1: S3-mode sessions are tenant-scoped; the user list is a cross-tenant
+    # system view and must not be exposed to them.
+    if user["username"].startswith("s3:"):
+        raise HTTPException(403, "User list is not available to S3-mode sessions")
     with _get_users_db() as db:
         rows = db.execute("SELECT username, role, created_at, totp_enabled, auth_source FROM users ORDER BY created_at").fetchall()
         # bucket-grant counts per user, so the UI can show "N buckets" at a glance
@@ -3282,7 +3311,7 @@ def twofa_enable(req: TwoFactorVerifyRequest, user: dict = Depends(get_current_u
     if not totp.verify(req.code, valid_window=1):
         raise HTTPException(400, "Invalid TOTP code")
     # Generate 10 recovery codes
-    recovery_plain = [secrets.token_hex(4) for _ in range(10)]
+    recovery_plain = [secrets.token_hex(8) for _ in range(10)]  # 64-bit codes (16 hex chars)
     recovery_hashes = json.dumps([bcrypt.hash(c) for c in recovery_plain])
     with _get_users_db() as db:
         db.execute("UPDATE users SET totp_enabled=1, recovery_codes=? WHERE username=?",
@@ -3501,9 +3530,18 @@ class CreateTokenRequest(BaseModel):
 @app.get("/api/auth/tokens")
 def list_tokens(user: dict = Depends(require_admin)):
     with _get_users_db() as db:
-        rows = db.execute(
-            "SELECT id, token_prefix, username, name, role, created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC"
-        ).fetchall()
+        # L1: S3-mode sessions are tenant-scoped — only their own tokens
+        # (they mint none, so this is empty; the point is cross-tenant isolation).
+        if user["username"].startswith("s3:"):
+            rows = db.execute(
+                "SELECT id, token_prefix, username, name, role, created_at, expires_at, last_used "
+                "FROM api_tokens WHERE username=? ORDER BY created_at DESC",
+                (user["username"],),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT id, token_prefix, username, name, role, created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC"
+            ).fetchall()
     return {"tokens": [dict(r) for r in rows]}
 
 @app.post("/api/auth/tokens")
@@ -3528,9 +3566,13 @@ def create_token(req: CreateTokenRequest, user: dict = Depends(require_local_adm
 @app.delete("/api/auth/tokens/{token_id}")
 def delete_token(token_id: int, user: dict = Depends(require_admin)):
     with _get_users_db() as db:
-        row = db.execute("SELECT id, name FROM api_tokens WHERE id=?", (token_id,)).fetchone()
+        row = db.execute("SELECT id, name, username FROM api_tokens WHERE id=?", (token_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Token not found")
+        # L1: S3-mode sessions are tenant-scoped — can only delete their own
+        # tokens, even though they carry role "admin".
+        if user["username"].startswith("s3:") and row["username"] != user["username"]:
+            raise HTTPException(403, "You can only delete your own tokens")
         db.execute("DELETE FROM api_tokens WHERE id=?", (token_id,))
         db.commit()
     _audit("delete_token", user["username"], details=f"token_id={token_id}")
@@ -3567,29 +3609,26 @@ def create_share_link(req: CreateShareLinkRequest, request: Request, user: dict 
 
 @app.get("/api/share-links")
 def list_share_links(bucket: str = "", user: dict = Depends(get_current_user)):
-    # Never expose the secret token column to list callers — only the resolver
-    # (/api/share/{token}) should accept it (V2). Non-admins see only their own
-    # rows; admins see all rows, optionally filtered by bucket.
+    # Never expose the secret token column to list callers (V2/A1) — only the
+    # resolver (/api/share/{token}) should accept it. L1 (PR 9): S3-mode sessions
+    # are tenant-scoped (only their own links) even though their role is "admin";
+    # non-admin password-mode users also see only their own (A1). Local/LDAP/OAuth/
+    # OIDC admins see all rows. Optional bucket filter applies in every case.
     cols = "id, bucket, key, created_by, created_at, expires_at, download_count, max_downloads"
+    tenant_scoped = user["username"].startswith("s3:") or user["role"] != "admin"
+    clauses, params = [], []
+    if tenant_scoped:
+        clauses.append("created_by = ?")
+        params.append(user["username"])
+    if bucket:
+        clauses.append("bucket = ?")
+        params.append(bucket)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with _get_users_db() as db:
-        if user["role"] != "admin":
-            if bucket:
-                rows = db.execute(
-                    f"SELECT {cols} FROM share_links WHERE bucket=? AND created_by=? ORDER BY created_at DESC",
-                    (bucket, user["username"])).fetchall()
-            else:
-                rows = db.execute(
-                    f"SELECT {cols} FROM share_links WHERE created_by=? ORDER BY created_at DESC",
-                    (user["username"],)).fetchall()
-        else:
-            if bucket:
-                rows = db.execute(
-                    f"SELECT {cols} FROM share_links WHERE bucket=? ORDER BY created_at DESC",
-                    (bucket,)).fetchall()
-            else:
-                rows = db.execute(
-                    f"SELECT {cols} FROM share_links ORDER BY created_at DESC"
-                ).fetchall()
+        rows = db.execute(
+            f"SELECT {cols} FROM share_links {where} ORDER BY created_at DESC",
+            params,
+        ).fetchall()
     return {"links": [dict(r) for r in rows]}
 
 @app.delete("/api/share-links/{link_id}")
@@ -3598,7 +3637,11 @@ def delete_share_link(link_id: int, user: dict = Depends(get_current_user)):
         row = db.execute("SELECT id, created_by FROM share_links WHERE id=?", (link_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Share link not found")
-        if user["role"] != "admin" and row["created_by"] != user["username"]:
+        # L1: S3-mode sessions are tenant-scoped — can only delete their own,
+        # even though they carry role "admin".
+        if row["created_by"] != user["username"] and (
+            user["username"].startswith("s3:") or user["role"] != "admin"
+        ):
             raise HTTPException(403, "You can only delete your own share links")
         db.execute("DELETE FROM share_links WHERE id=?", (link_id,))
         db.commit()
@@ -4052,6 +4095,7 @@ def oauth_callback(provider: str, code: str, request: Request, state: str = ""):
         _secure_cookie = os.environ.get("SECURE_COOKIE", "true").lower() != "false"
         response.set_cookie("access_token", pending_token, httponly=True, samesite="strict",
                             secure=_secure_cookie, max_age=300, path="/")
+        response.delete_cookie("oauth_state", path="/api/auth/oauth")
         return response
 
     # Issue JWT and redirect to app
@@ -4063,6 +4107,7 @@ def oauth_callback(provider: str, code: str, request: Request, state: str = ""):
     _secure_cookie = os.environ.get("SECURE_COOKIE", "true").lower() != "false"
     response.set_cookie("access_token", token, httponly=True, samesite="strict",
                         secure=_secure_cookie, max_age=SESSION_HOURS * 3600, path="/")
+    response.delete_cookie("oauth_state", path="/api/auth/oauth")
     _audit("login", username, details=f"method=oauth_{provider}")
     return response
 
@@ -4360,6 +4405,10 @@ def get_audit_log(
     bucket: str = "",
     user: dict = Depends(require_admin),
 ):
+    # L1: S3-mode sessions are tenant-scoped; the audit log is a cross-tenant
+    # system view and must not be exposed to them.
+    if user["username"].startswith("s3:"):
+        raise HTTPException(403, "Audit log is not available to S3-mode sessions")
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     clauses = []
