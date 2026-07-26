@@ -17,10 +17,11 @@ from security import (
     validate_bucket_name,
     validate_limit,
 )
+from session_ctx import current_session
 
 
 def _ctx_session(ctx):
-    return ctx.request_context.lifespan_context["session"]
+    return current_session()
 
 
 def _ctx_auth(ctx):

@@ -6,9 +6,12 @@ The overview resource is especially important — it lets the AI know
 what buckets exist so users never have to specify bucket names.
 """
 
+from auth import AuthorizationError
+
 from db import get_db, list_bucket_dbs, check_table_exists
 from observability import logger
 from security import format_bytes, format_number, sanitize_result
+from session_ctx import current_session
 
 
 def register(mcp):
@@ -24,6 +27,7 @@ def register(mcp):
         ),
     )
     async def storage_overview() -> str:
+        session = current_session()
         bucket_dbs = list_bucket_dbs()
         if not bucket_dbs:
             return "No buckets found. The storage system may not be indexed yet."
@@ -33,9 +37,13 @@ def register(mcp):
         buckets_info = []
 
         for bdb in bucket_dbs:
-            info = {"name": bdb["bucket"], "endpoint": bdb["endpoint_id"]}
+            bucket = bdb["bucket"]
+            # Filter to buckets the caller may read (mirrors tools/discovery.py)
+            if not session.is_admin and not session.can_read_bucket(bucket):
+                continue
+            info = {"name": bucket, "endpoint": bdb["endpoint_id"]}
             try:
-                with get_db(bdb["bucket"], bdb["endpoint_id"]) as db:
+                with get_db(bucket, bdb["endpoint_id"]) as db:
                     if check_table_exists(db, "crawl_status"):
                         row = db.execute(
                             "SELECT total_objects, total_size, status, last_crawl_end "
@@ -52,6 +60,9 @@ def register(mcp):
                 info["status"] = "error"
 
             buckets_info.append(info)
+
+        if not buckets_info:
+            return "No buckets found. Either no buckets exist or you don't have access to any."
 
         lines = [
             "# Storage Overview\n",
@@ -80,6 +91,9 @@ def register(mcp):
         ),
     )
     async def bucket_summary(bucket: str) -> str:
+        session = current_session()
+        if not session.can_read_bucket(bucket):
+            raise AuthorizationError(f"You don't have read access to bucket '{bucket}'.")
         try:
             with get_db(bucket) as db:
                 lines = [f"# Bucket: {bucket}\n"]
