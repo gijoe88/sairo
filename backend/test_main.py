@@ -263,6 +263,23 @@ def _main_module():
     return m
 
 
+def _mint_s3_cookie(username):
+    """Construct an S3-mode session cookie directly. The login-s3 route issues
+    exactly this JWT (sub='s3:...', role='admin'); minting it here avoids the
+    shared login rate limiter (LOGIN_RATE_MAX=10 / 300s) that the route enforces
+    and keeps these guard tests isolated from the login path. The s3ak/s3sk
+    claims that the route also carries are only needed for live S3 calls, which
+    these endpoints don't make, so they're omitted. Mirrors F7's use of jwt."""
+    import jwt as _jwt
+    m = _main_module()
+    token = _jwt.encode(
+        {"sub": username, "role": "admin",
+         "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
+        m.JWT_SECRET, algorithm="HS256",
+    )
+    return {"access_token": token}
+
+
 class TestOIDC:
     """Generic OpenID Connect login (issue #9): username-only sync, admin perms."""
 
@@ -1093,3 +1110,161 @@ class TestOAuthStateCookieCleared:
             assert "requires_2fa=true" in resp.headers["location"]
             assert resp.cookies.get("access_token"), "pending 2FA cookie should be issued"
             assert _cookie_deletion_set(resp.headers, "oauth_state", "/api/auth/oauth")
+
+
+# ── L1: S3-mode tenant scoping ───────────────────────────
+
+class TestS3ModeTenantScoping:
+    """L1: an S3-mode session (sub='s3:...', role='admin') passes require_admin,
+    so in a multi-tenant S3 deployment the share-link/token/audit/user endpoints
+    must be scoped or blocked to prevent one tenant reading another tenant's
+    data. Non-s3 admins keep full access (non-regression)."""
+
+    S3_USER = "s3:AKIAL100"   # mirrors login-s3's f"s3:{access_key[:8]}"
+
+    def test_s3_session_cannot_list_other_tenants_share_links(self, app, client, admin_cookies):
+        """S3 session sees only its own share_links; a local admin still sees all."""
+        m = _main_module()
+        s3_cookie = _mint_s3_cookie(self.S3_USER)
+        with TestClient(app) as c:
+            with m._get_users_db() as db:
+                db.execute("DELETE FROM share_links WHERE token LIKE 'l1sl-%'")
+                db.execute(
+                    "INSERT INTO share_links (token, bucket, key, created_by, expires_at) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1sl-alice", "alice-bkt", "alice.txt", "alice", "2030-01-01T00:00:00+00:00"))
+                db.execute(
+                    "INSERT INTO share_links (token, bucket, key, created_by, expires_at) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1sl-s3a", "s3-bkt", "a.txt", self.S3_USER, "2030-01-01T00:00:00+00:00"))
+                db.execute(
+                    "INSERT INTO share_links (token, bucket, key, created_by, expires_at) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1sl-s3b", "s3-bkt", "b.txt", self.S3_USER, "2030-01-01T00:00:00+00:00"))
+                db.commit()
+            # S3 session: only its own rows — alice's link must be absent.
+            resp = c.get("/api/share-links", cookies=s3_cookie)
+            assert resp.status_code == 200
+            owners = {l["created_by"] for l in resp.json()["links"]}
+            assert "alice" not in owners
+            assert self.S3_USER in owners
+        # Non-regression: a normal local admin still sees alice's link.
+        resp = client.get("/api/share-links", cookies=admin_cookies)
+        assert resp.status_code == 200
+        owners = {l["created_by"] for l in resp.json()["links"]}
+        assert "alice" in owners
+
+    def test_s3_session_cannot_delete_other_tenants_share_link(self, app):
+        """S3 session gets 403 deleting another tenant's link, 200 on its own."""
+        m = _main_module()
+        s3_cookie = _mint_s3_cookie(self.S3_USER)
+        with TestClient(app) as c:
+            with m._get_users_db() as db:
+                db.execute("DELETE FROM share_links WHERE token LIKE 'l1sd-%'")
+                db.execute(
+                    "INSERT INTO share_links (token, bucket, key, created_by, expires_at) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1sd-alice", "alice-bkt", "alice.txt", "alice", "2030-01-01T00:00:00+00:00"))
+                db.execute(
+                    "INSERT INTO share_links (token, bucket, key, created_by, expires_at) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1sd-s3", "s3-bkt", "own.txt", self.S3_USER, "2030-01-01T00:00:00+00:00"))
+                db.commit()
+                alice_id = db.execute(
+                    "SELECT id FROM share_links WHERE token='l1sd-alice'").fetchone()["id"]
+                own_id = db.execute(
+                    "SELECT id FROM share_links WHERE token='l1sd-s3'").fetchone()["id"]
+            # Cross-tenant delete -> 403, row survives.
+            resp = c.delete(f"/api/share-links/{alice_id}", cookies=s3_cookie)
+            assert resp.status_code == 403
+            with m._get_users_db() as db:
+                assert db.execute(
+                    "SELECT id FROM share_links WHERE id=?", (alice_id,)).fetchone() is not None
+            # Own delete -> 200.
+            resp = c.delete(f"/api/share-links/{own_id}", cookies=s3_cookie)
+            assert resp.status_code == 200
+
+    def test_s3_session_list_tokens_scoped_to_self(self, app, client, admin_cookies):
+        """S3 session's token list excludes other tenants; local admin sees all."""
+        m = _main_module()
+        s3_cookie = _mint_s3_cookie(self.S3_USER)
+        with TestClient(app) as c:
+            with m._get_users_db() as db:
+                db.execute("DELETE FROM api_tokens WHERE token_hash LIKE 'l1tl-%'")
+                db.execute(
+                    "INSERT INTO api_tokens (token_hash, token_prefix, username, name, role) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1tl-alice", "l1tl-alice...", "alice", "alice-tok", "admin"))
+                db.commit()
+            # S3 session: alice's token must be absent (s3 sessions mint none).
+            resp = c.get("/api/auth/tokens", cookies=s3_cookie)
+            assert resp.status_code == 200
+            owners = {t["username"] for t in resp.json()["tokens"]}
+            assert "alice" not in owners
+        # Non-regression: local admin still sees alice's token.
+        resp = client.get("/api/auth/tokens", cookies=admin_cookies)
+        assert resp.status_code == 200
+        owners = {t["username"] for t in resp.json()["tokens"]}
+        assert "alice" in owners
+
+    def test_s3_session_cannot_delete_other_tenants_token(self, app):
+        """S3 session gets 403 deleting another tenant's API token; row survives."""
+        m = _main_module()
+        s3_cookie = _mint_s3_cookie(self.S3_USER)
+        with TestClient(app) as c:
+            with m._get_users_db() as db:
+                db.execute("DELETE FROM api_tokens WHERE token_hash LIKE 'l1td-%'")
+                db.execute(
+                    "INSERT INTO api_tokens (token_hash, token_prefix, username, name, role) "
+                    "VALUES (?,?,?,?,?)",
+                    ("l1td-alice", "l1td-alice...", "alice", "alice-tok", "admin"))
+                db.commit()
+                alice_tok = db.execute(
+                    "SELECT id FROM api_tokens WHERE token_hash='l1td-alice'").fetchone()["id"]
+            resp = c.delete(f"/api/auth/tokens/{alice_tok}", cookies=s3_cookie)
+            assert resp.status_code == 403
+            with m._get_users_db() as db:
+                assert db.execute(
+                    "SELECT id FROM api_tokens WHERE id=?", (alice_tok,)).fetchone() is not None
+
+    def test_s3_session_blocked_from_audit_log(self, app, client, admin_cookies):
+        """S3 session gets 403 on the cross-tenant audit log; local admin reads it."""
+        m = _main_module()
+        s3_cookie = _mint_s3_cookie(self.S3_USER)
+        with TestClient(app) as c:
+            resp = c.get("/api/audit-log", cookies=s3_cookie)
+            assert resp.status_code == 403
+        # Non-regression: a normal local admin can still read the audit log.
+        assert client.get("/api/audit-log", cookies=admin_cookies).status_code == 200
+
+    def test_s3_session_blocked_from_user_list(self, app, client, admin_cookies):
+        """S3 session gets 403 on the cross-tenant user list; local admin reads it."""
+        m = _main_module()
+        s3_cookie = _mint_s3_cookie(self.S3_USER)
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/users", cookies=s3_cookie)
+            assert resp.status_code == 403
+        # Non-regression: a normal local admin can still list users.
+        assert client.get("/api/auth/users", cookies=admin_cookies).status_code == 200
+
+
+# ── L2: HSTS ─────────────────────────────────────────────
+
+class TestHSTS:
+    """L2: Strict-Transport-Security is advertised only when the request scheme
+    is https, so dev/localhost (http) isn't pinned."""
+
+    def test_hsts_present_on_https(self, app):
+        """An https request advertises HSTS with the exact expected value."""
+        with TestClient(app, base_url="https://testserver") as c:
+            resp = c.get("/api/branding")
+            assert resp.status_code == 200
+            assert resp.headers["Strict-Transport-Security"] == (
+                "max-age=31536000; includeSubDomains"
+            )
+
+    def test_hsts_absent_on_http(self, client):
+        """An http request must NOT pin HSTS (dev/localhost safety)."""
+        resp = client.get("/api/branding")
+        assert resp.status_code == 200
+        assert "Strict-Transport-Security" not in resp.headers

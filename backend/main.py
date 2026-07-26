@@ -106,6 +106,13 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # L2: advertise HTTPS-only access only when the transport is actually HTTPS
+    # (direct-https deploys, or a proxy that sets the scheme). Absent on http so
+    # dev/localhost isn't pinned.
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
     return response
 
 
@@ -3022,6 +3029,10 @@ def auth_refresh(user: dict = Depends(get_current_user)):
 
 @app.get("/api/auth/users")
 def auth_list_users(user: dict = Depends(require_admin)):
+    # L1: S3-mode sessions are tenant-scoped; the user list is a cross-tenant
+    # system view and must not be exposed to them.
+    if user["username"].startswith("s3:"):
+        raise HTTPException(403, "User list is not available to S3-mode sessions")
     with _get_users_db() as db:
         rows = db.execute("SELECT username, role, created_at, totp_enabled, auth_source FROM users ORDER BY created_at").fetchall()
         # bucket-grant counts per user, so the UI can show "N buckets" at a glance
@@ -3326,9 +3337,18 @@ class CreateTokenRequest(BaseModel):
 @app.get("/api/auth/tokens")
 def list_tokens(user: dict = Depends(require_admin)):
     with _get_users_db() as db:
-        rows = db.execute(
-            "SELECT id, token_prefix, username, name, role, created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC"
-        ).fetchall()
+        # L1: S3-mode sessions are tenant-scoped — only their own tokens
+        # (they mint none, so this is empty; the point is cross-tenant isolation).
+        if user["username"].startswith("s3:"):
+            rows = db.execute(
+                "SELECT id, token_prefix, username, name, role, created_at, expires_at, last_used "
+                "FROM api_tokens WHERE username=? ORDER BY created_at DESC",
+                (user["username"],),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT id, token_prefix, username, name, role, created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC"
+            ).fetchall()
     return {"tokens": [dict(r) for r in rows]}
 
 @app.post("/api/auth/tokens")
@@ -3353,9 +3373,13 @@ def create_token(req: CreateTokenRequest, user: dict = Depends(require_admin)):
 @app.delete("/api/auth/tokens/{token_id}")
 def delete_token(token_id: int, user: dict = Depends(require_admin)):
     with _get_users_db() as db:
-        row = db.execute("SELECT id, name FROM api_tokens WHERE id=?", (token_id,)).fetchone()
+        row = db.execute("SELECT id, name, username FROM api_tokens WHERE id=?", (token_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Token not found")
+        # L1: S3-mode sessions are tenant-scoped — can only delete their own
+        # tokens, even though they carry role "admin".
+        if user["username"].startswith("s3:") and row["username"] != user["username"]:
+            raise HTTPException(403, "You can only delete your own tokens")
         db.execute("DELETE FROM api_tokens WHERE id=?", (token_id,))
         db.commit()
     _audit("delete_token", user["username"], details=f"token_id={token_id}")
@@ -3386,15 +3410,21 @@ def create_share_link(req: CreateShareLinkRequest, user: dict = Depends(get_curr
 
 @app.get("/api/share-links")
 def list_share_links(bucket: str = "", user: dict = Depends(get_current_user)):
+    # L1: S3-mode sessions are tenant-scoped — only their own share links.
+    clauses, params = [], []
+    if user["username"].startswith("s3:"):
+        clauses.append("created_by = ?")
+        params.append(user["username"])
+    if bucket:
+        clauses.append("bucket = ?")
+        params.append(bucket)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with _get_users_db() as db:
-        if bucket:
-            rows = db.execute(
-                "SELECT id, token, bucket, key, created_by, created_at, expires_at, download_count, max_downloads FROM share_links WHERE bucket=? ORDER BY created_at DESC",
-                (bucket,)).fetchall()
-        else:
-            rows = db.execute(
-                "SELECT id, token, bucket, key, created_by, created_at, expires_at, download_count, max_downloads FROM share_links ORDER BY created_at DESC"
-            ).fetchall()
+        rows = db.execute(
+            f"SELECT id, token, bucket, key, created_by, created_at, expires_at, download_count, max_downloads "
+            f"FROM share_links {where} ORDER BY created_at DESC",
+            params,
+        ).fetchall()
     return {"links": [dict(r) for r in rows]}
 
 @app.delete("/api/share-links/{link_id}")
@@ -3403,7 +3433,11 @@ def delete_share_link(link_id: int, user: dict = Depends(get_current_user)):
         row = db.execute("SELECT id, created_by FROM share_links WHERE id=?", (link_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Share link not found")
-        if user["role"] != "admin" and row["created_by"] != user["username"]:
+        # L1: S3-mode sessions are tenant-scoped — can only delete their own,
+        # even though they carry role "admin".
+        if row["created_by"] != user["username"] and (
+            user["username"].startswith("s3:") or user["role"] != "admin"
+        ):
             raise HTTPException(403, "You can only delete your own share links")
         db.execute("DELETE FROM share_links WHERE id=?", (link_id,))
         db.commit()
@@ -4092,6 +4126,10 @@ def get_audit_log(
     bucket: str = "",
     user: dict = Depends(require_admin),
 ):
+    # L1: S3-mode sessions are tenant-scoped; the audit log is a cross-tenant
+    # system view and must not be exposed to them.
+    if user["username"].startswith("s3:"):
+        raise HTTPException(403, "Audit log is not available to S3-mode sessions")
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     clauses = []
