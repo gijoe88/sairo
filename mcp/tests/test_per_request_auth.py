@@ -283,7 +283,6 @@ async def test_t1_no_authorization_returns_401(mcp_app_client):
 
 # ─── T2: valid viewer Bearer → tool runs as caller identity ────────────────────
 
-@pytest.mark.xfail(reason=BUG_REASON, strict=False)
 async def test_t2_viewer_bearer_lists_only_authorized_bucket(mcp_app_client):
     """T2 — core ContextVar-propagation proof.
 
@@ -302,7 +301,6 @@ async def test_t2_viewer_bearer_lists_only_authorized_bucket(mcp_app_client):
 
 # ─── T3: admin-only tool + viewer token → authorization denied ─────────────────
 
-@pytest.mark.xfail(reason=BUG_REASON, strict=False)
 async def test_t3_admin_tool_denied_for_viewer(mcp_app_client):
     """T3: ``get_audit_log`` (admin-only) called with a viewer token must be
     denied (``require_admin`` raises AuthorizationError → isError result), not
@@ -323,7 +321,6 @@ async def test_t3_admin_tool_denied_for_viewer(mcp_app_client):
 
 # ─── T4: resources/read overview scoped to caller ───────────────────────────────
 
-@pytest.mark.xfail(reason=BUG_REASON, strict=False)
 async def test_t4_overview_resource_scoped_to_caller(mcp_app_client):
     """T4 (V3 per-bucket resource authz): ``resources/read objex://overview``
     with ALPHA_TOKEN must contain ``alpha`` and NOT ``beta``."""
@@ -387,7 +384,6 @@ async def test_t7_cross_origin_rejected(mcp_app_client, monkeypatch):
 
 # ─── T8: CRITICAL — ContextVar propagation / concurrent identity isolation ──────
 
-@pytest.mark.xfail(reason=BUG_REASON, strict=False)
 async def test_t8_concurrent_contextvar_isolation(mcp_app_client):
     """T8 — regression guard for the §4.1.7 ContextVar-propagation spike.
 
