@@ -139,6 +139,18 @@ proxying. This is additive and can land later without changing Tier 1/2 UX.
 Tier 1 gives a guaranteed win with zero new deps; Tier 2 layers duckdb-wasm on
 top exactly where it shines (interactive SQL on manageable files).
 
+### CSP requirement (Tier 2 deployment dependency)
+
+Tier 2 calls `WebAssembly.instantiateStreaming()` inside the duckdb worker.
+Since Chrome 93 / Firefox 101 / Safari 16.4, the app CSP's `script-src` must
+include the **`'wasm-unsafe-eval'`** keyword or the compile is blocked and the
+SQL tab hangs forever on its loading spinner (the `.wasm` bytes still fetch
+fine under `connect-src 'self'`; only the compile is gated). The backend's
+`security_headers_middleware` originally shipped `script-src 'self'` only, so
+the CSP had to be updated for this feature. See
+[`docs/architecture/csp-wasm-instantiation.md`](csp-wasm-instantiation.md)
+for the rationale, rejected alternatives, and the exact one-line change.
+
 ## 4. Component & file organization
 
 ### Backend
