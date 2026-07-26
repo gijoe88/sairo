@@ -40,11 +40,11 @@ vi.mock("@duckdb/duckdb-wasm", () => ({
   })),
   ConsoleLogger: vi.fn(),
 }));
-vi.mock("@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url", () => ({
-  default: "/fake-duckdb-eh.worker.js",
+vi.mock("@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url", () => ({
+  default: "/fake-duckdb-mvp.worker.js",
 }));
-vi.mock("@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url", () => ({
-  default: "/fake-duckdb-eh.wasm",
+vi.mock("@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url", () => ({
+  default: "/fake-duckdb-mvp.wasm",
 }));
 
 // jsdom has no Worker global; getDuckDB() calls `new Worker(workerUrl)`. Provide
