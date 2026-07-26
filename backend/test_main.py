@@ -936,6 +936,10 @@ class TestCookieSessionDBValidation:
 
     def test_deleted_user_cookie_is_rejected(self, app, client, admin_cookies):
         m = _main_module()
+        # Idempotency: clear any leftover row from a prior warm run.
+        with m._get_users_db() as db:
+            db.execute("DELETE FROM users WHERE username=?", ("f7-deleted",))
+            db.commit()
         resp = client.post(
             "/api/auth/users",
             json={"username": "f7-deleted", "password": "pw12345678", "role": "viewer"},
@@ -961,6 +965,10 @@ class TestCookieSessionDBValidation:
 
     def test_demoted_admin_role_updates_and_admin_route_blocks(self, app, client, admin_cookies):
         m = _main_module()
+        # Idempotency: clear any leftover row from a prior warm run.
+        with m._get_users_db() as db:
+            db.execute("DELETE FROM users WHERE username=?", ("f7-demoted",))
+            db.commit()
         resp = client.post(
             "/api/auth/users",
             json={"username": "f7-demoted", "password": "pw12345678", "role": "admin"},
@@ -990,6 +998,11 @@ class TestCookieSessionDBValidation:
 
     def test_live_user_cookie_still_works(self, app, client, admin_cookies):
         """Sanity: the DB check must not break a live, unmodified user's cookie."""
+        m = _main_module()
+        # Idempotency: clear any leftover row from a prior warm run.
+        with m._get_users_db() as db:
+            db.execute("DELETE FROM users WHERE username=?", ("f7-live",))
+            db.commit()
         client.post(
             "/api/auth/users",
             json={"username": "f7-live", "password": "pw12345678", "role": "viewer"},
@@ -1036,6 +1049,11 @@ class TestTwoFactorRecoveryEntropy:
         import re
         import pyotp
         m = _main_module()
+        # Idempotency: clear any leftover row (incl. 2FA state columns carried on
+        # the users row) from a prior warm run so setup starts clean.
+        with m._get_users_db() as db:
+            db.execute("DELETE FROM users WHERE username=?", ("f7-2fa",))
+            db.commit()
         # Use a dedicated user so the shared admin is not 2FA-locked for later tests.
         client.post(
             "/api/auth/users",
