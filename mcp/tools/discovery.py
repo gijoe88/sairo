@@ -23,10 +23,11 @@ from security import (
     validate_sort_field,
     validate_sort_order,
 )
+from session_ctx import current_session
 
 
 def _ctx_session(ctx):
-    return ctx.request_context.lifespan_context["session"]
+    return current_session()
 
 
 def _ctx_auth(ctx):

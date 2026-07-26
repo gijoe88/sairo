@@ -13,6 +13,7 @@ _test_dir = tempfile.mkdtemp(prefix="sairo-mcp-e2e-")
 os.environ["DB_DIR"] = _test_dir
 os.environ["SAIRO_API_URL"] = "http://localhost:9999"
 os.environ["SAIRO_API_TOKEN"] = ""
+os.environ["MCP_DEV_MODE"] = "true"
 os.environ["MCP_LOG_LEVEL"] = "WARNING"
 os.environ["MCP_LOG_FORMAT"] = "text"
 

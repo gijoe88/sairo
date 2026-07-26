@@ -12,22 +12,33 @@ Run with:
     python server.py --transport stdio      # stdio for Claude Desktop / CLI
 """
 
+import hmac
 import os
 import sys
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
-from auth import AuthManager, UserSession
+from auth import AuthManager, AuthorizationError, UserSession
 from db import close_all as close_db_pool
 from observability import logger, metrics
 from sairo_client import SairoClient
+from session_ctx import has_session, reset_session, set_session
 
 # --- Configuration ---
 
 MCP_NAME = os.environ.get("MCP_NAME", "Sairo Storage Intelligence")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8100"))
 MCP_HOST = os.environ.get("MCP_BIND_HOST", "127.0.0.1")
+
+# --- Shared singletons ---
+# Constructed once at import time so the ASGI middleware and the FastMCP
+# lifespan share the same AuthManager / SairoClient (and its session cache).
+# Network startup/shutdown happens inside the lifespan.
+sairo_client = SairoClient()
+auth_manager = AuthManager(sairo_client)
 
 # --- Server Instructions ---
 
@@ -116,43 +127,23 @@ chain them together, and synthesize clear answers.
 """
 
 
-# --- Helpers to get auth/sairo from context ---
-
-def get_session(ctx) -> UserSession:
-    """Get the authenticated user session from the tool context."""
-    lc = ctx.request_context.lifespan_context
-    return lc["session"]
-
-
-def get_auth(ctx) -> AuthManager:
-    """Get the auth manager from the tool context."""
-    lc = ctx.request_context.lifespan_context
-    return lc["auth"]
-
-
-def get_sairo(ctx) -> SairoClient:
-    """Get the Sairo API client from the tool context."""
-    lc = ctx.request_context.lifespan_context
-    return lc["sairo"]
-
-
 # --- Lifespan ---
 
 @asynccontextmanager
 async def lifespan(server: FastMCP):
     """
     Initialize shared resources on startup, clean up on shutdown.
-    Authenticates using the SAIRO_API_TOKEN env var once at startup.
+
+    Authenticates using the SAIRO_API_TOKEN env var once at startup and binds
+    the resulting session to the process-default ContextVar (so the stdio and
+    in-memory transports populate ``current_session()`` for tool execution).
+    On the HTTP path, ``SairoBearerAuthMiddleware`` overrides this per request.
     """
-    sairo = SairoClient()
-    await sairo.start()
-
-    auth_manager = AuthManager(sairo)
-
+    await sairo_client.start()
     logger.info("Sairo MCP server starting", extra={"tool": "server"})
 
     # Verify connectivity
-    healthy = await sairo.health_check()
+    healthy = await sairo_client.health_check()
     if healthy:
         logger.info("Connected to Sairo API", extra={"tool": "server"})
     else:
@@ -161,9 +152,11 @@ async def lifespan(server: FastMCP):
             extra={"tool": "server"},
         )
 
-    # Pre-authenticate using the service token
-    session = None
     token = os.environ.get("SAIRO_API_TOKEN", "")
+    dev_mode = os.environ.get("MCP_DEV_MODE", "false").lower() == "true"
+
+    # Pre-authenticate using the service token (if any)
+    session = None
     if token:
         try:
             session = await auth_manager.authenticate(token)
@@ -172,41 +165,39 @@ async def lifespan(server: FastMCP):
                 extra={"tool": "server"},
             )
         except Exception as e:
-            logger.warning(f"Auth failed: {e}. Tools requiring auth will fail.", extra={"tool": "server"})
-
-    # If no token or auth failed, only allow admin fallback in explicit dev mode
-    if session is None:
-        dev_mode = os.environ.get("MCP_DEV_MODE", "false").lower() == "true"
-        if dev_mode:
             logger.warning(
-                "MCP_DEV_MODE=true — running with default admin session (local dev only)",
+                f"Auth failed: {e}. Tools requiring auth will fail.",
                 extra={"tool": "server"},
             )
-            session = UserSession(
-                username="mcp-local",
-                role="admin",
-                token="",
-            )
-        else:
-            logger.error(
-                "No SAIRO_API_TOKEN set and MCP_DEV_MODE is not enabled. "
-                "Set SAIRO_API_TOKEN for production or MCP_DEV_MODE=true for local dev.",
-                extra={"tool": "server"},
-            )
-            session = UserSession(
-                username="mcp-anonymous",
-                role="viewer",
-                token="",
-            )
+
+    # Admin bootstrap is only minted in explicit dev mode.
+    if session is None and dev_mode:
+        logger.warning(
+            "MCP_DEV_MODE=true — running with default admin session (local dev only)",
+            extra={"tool": "server"},
+        )
+        session = UserSession(
+            username="mcp-local",
+            role="admin",
+            token="",
+        )
+
+    # Only bind the bootstrap session when none is already bound. On the HTTP
+    # path the bearer middleware binds the caller's session per-request (and
+    # this lifespan runs inside that request's task, inheriting that binding);
+    # on the stdio / in-memory path nothing else binds one, so the bootstrap
+    # session applies there.
+    if session is not None and not has_session():
+        set_session(session)
 
     try:
         yield {
-            "sairo": sairo,
+            "sairo": sairo_client,
             "auth": auth_manager,
             "session": session,
         }
     finally:
-        await sairo.close()
+        await sairo_client.close()
         close_db_pool()
         logger.info("Sairo MCP server stopped", extra={"tool": "server"})
 
@@ -219,6 +210,8 @@ mcp = FastMCP(
     lifespan=lifespan,
     host=MCP_HOST,
     port=MCP_PORT,
+    stateless_http=True,
+    json_response=True,
 )
 
 
@@ -267,21 +260,99 @@ async def readyz(request):
 
 @mcp.custom_route("/metrics", methods=["GET"])
 async def metrics_endpoint(request):
-    """Prometheus-style metrics. Requires SAIRO_API_TOKEN or MCP_DEV_MODE."""
-    from starlette.responses import JSONResponse
-    token = os.environ.get("SAIRO_API_TOKEN", "")
-    dev_mode = os.environ.get("MCP_DEV_MODE", "false").lower() == "true"
-    if token and not dev_mode:
-        auth_header = request.headers.get("authorization", "")
-        if auth_header != f"Bearer {token}":
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    """Prometheus-style metrics.
+
+    Authentication is enforced by ``SairoBearerAuthMiddleware`` (a valid
+    Sairo bearer token is required; ``/healthz`` and ``/readyz`` are the only
+    public paths).
+    """
     return JSONResponse(metrics.get_summary())
+
+
+# --- Bearer Auth Middleware ---
+
+class SairoBearerAuthMiddleware(BaseHTTPMiddleware):
+    """ASGI middleware that gates every non-public path behind a Sairo bearer
+    token and binds the resulting session to the per-request ContextVar.
+
+    - Public paths (``/healthz``, ``/readyz``) are allowed through unconditionally.
+    - On the MCP ``/mcp`` route, browser ``Origin`` headers are checked against an
+      allow-list to block DNS-rebinding (406 on mismatch).
+    - The bearer scheme prefix is compared constant-time (``hmac.compare_digest``)
+      to avoid a timing oracle on the auth scheme.
+    - A valid ``UserSession`` is bound via :func:`session_ctx.set_session` for the
+      duration of the request and reset in ``finally``.
+    """
+
+    PUBLIC_PATHS = {"/healthz", "/readyz"}
+    LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+    async def dispatch(self, request, call_next):
+        # 1. Public allow-list (health/readiness probes).
+        if request.url.path in self.PUBLIC_PATHS:
+            return await call_next(request)
+
+        # 2. DNS-rebinding / Origin guard for the Streamable HTTP route. Browsers
+        #    always send Origin; non-browser MCP clients typically don't, so we
+        #    only enforce when the header is present.
+        if request.url.path == "/mcp":
+            origin = request.headers.get("origin")
+            if origin:
+                allowed_raw = os.environ.get("MCP_ALLOWED_ORIGINS", "")
+                if allowed_raw:
+                    allowed = {
+                        o.strip().rstrip("/") for o in allowed_raw.split(",") if o.strip()
+                    }
+                else:
+                    allowed = {
+                        f"{request.url.scheme}://{request.url.netloc}".rstrip("/")
+                    }
+                if origin.rstrip("/") not in allowed:
+                    return JSONResponse(
+                        {"jsonrpc": "2.0",
+                         "error": {"code": -32026, "message": "Origin not allowed"}},
+                        status_code=406,
+                    )
+
+        # 3. Extract bearer token (constant-time on the scheme prefix).
+        auth_header = request.headers.get("authorization", "")
+        parts = auth_header.split(" ", 1)
+        if (
+            len(parts) != 2
+            or not hmac.compare_digest(parts[0].lower().encode(), b"bearer")
+            or not parts[1]
+        ):
+            return JSONResponse(
+                {"error": "missing or malformed Authorization header"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        token = parts[1].strip()
+
+        # 4. Validate token and build a session. AuthorizationError -> 401;
+        #    unexpected errors propagate as 5xx (do not mask them).
+        try:
+            session = await auth_manager.authenticate(token)
+        except AuthorizationError:
+            return JSONResponse(
+                {"error": "invalid or expired token"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # 5. Propagate the session via ContextVar for the request body, then reset.
+        reset_token = set_session(session)
+        try:
+            response = await call_next(request)
+        finally:
+            reset_session(reset_token)
+        return response
 
 
 # --- Entry Point ---
 
 def main():
-    """Run the MCP server."""
+    """Run the MCP server (with fail-closed startup + dev loopback guard)."""
     transport = "streamable-http"
     if "--transport" in sys.argv:
         idx = sys.argv.index("--transport")
@@ -290,12 +361,36 @@ def main():
     elif "--stdio" in sys.argv:
         transport = "stdio"
 
+    token = os.environ.get("SAIRO_API_TOKEN", "")
+    dev_mode = os.environ.get("MCP_DEV_MODE", "false").lower() == "true"
+
+    # Fail-closed (V4): refuse to boot without a token unless dev mode is explicit.
+    if not token and not dev_mode:
+        logger.error(
+            "SAIRO_API_TOKEN is unset and MCP_DEV_MODE is not enabled. "
+            "Refusing to start (fail-closed). Set SAIRO_API_TOKEN or "
+            "MCP_DEV_MODE=true for local dev."
+        )
+        sys.exit(1)
+
+    # Dev mode must bind to loopback (no socket exposure of the dev admin).
+    if dev_mode and transport != "stdio":
+        if MCP_HOST.lower() not in SairoBearerAuthMiddleware.LOOPBACK_HOSTS:
+            logger.error(
+                f"MCP_DEV_MODE=true requires a loopback bind (MCP_BIND_HOST), "
+                f"got: {MCP_HOST}"
+            )
+            sys.exit(1)
+
     if transport == "stdio":
         logger.info("Starting MCP server (stdio transport)")
         mcp.run(transport="stdio")
     else:
         logger.info(f"Starting MCP server (HTTP on {MCP_HOST}:{MCP_PORT})")
-        mcp.run(transport="streamable-http")
+        app = mcp.streamable_http_app()
+        app.add_middleware(SairoBearerAuthMiddleware)
+        import uvicorn
+        uvicorn.run(app, host=MCP_HOST, port=MCP_PORT)
 
 
 if __name__ == "__main__":
