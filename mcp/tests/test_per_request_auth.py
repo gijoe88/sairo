@@ -35,18 +35,13 @@ JSON-RPC request sequence (settled on after spiking):
     (and a ``structuredContent`` describing the error) rather than a JSON-RPC
     top-level error, so the result parser below checks both.
 
-KNOWN IMPLEMENTATION BUG (see ``test_per_request_auth_bug_report`` and the
-``xfail`` markers on T2/T3/T4/T8): on the HTTP transport the per-request
-``lifespan()`` in ``server.py`` calls ``set_session(...)`` for the service /
-dev-bootstrap session AFTER the middleware has bound the bearer session. Because
-the streamable_http manager runs the lifespan *inside* the request task that
-inherits (and then shadows) the middleware's ContextVar binding, the lifespan
-session wins and every HTTP request executes as the service/dev-admin identity.
-The bearer session is never seen by tools. These four tests encode the
-REQUIRED behaviour and are marked ``xfail(strict=False)`` so the suite stays
-green while the bug is open; once the middleware session is made to win, remove
-the markers and they will pass (and T8 will guard against any future SDK bump
-that re-breaks ContextVar propagation).
+Regression-guard status: an earlier lifespan-clobber bug on this transport
+(the per-request ``lifespan()`` re-binding the session ContextVar AFTER the
+bearer middleware had set it, so every HTTP request ran as the service /
+dev-admin identity instead of the caller) was found and fixed. T2/T3/T4/T8
+now run live and enforce that the bearer middleware's session wins; any future
+regression (SDK bump, middleware rewrite, task-group re-parenting) fails the
+suite instead of silently leaking the service/admin identity.
 """
 
 # ─── Imports & test-only bucket DBs ───────────────────────────────────────────
@@ -108,17 +103,6 @@ async def _fake_authenticate(token: str) -> UserSession:
     raise AuthorizationError("unknown token")
 
 
-BUG_REASON = (
-    "KNOWN BUG: on the HTTP transport the per-request lifespan() in server.py "
-    "calls set_session() for the service/dev-bootstrap session AFTER the bearer "
-    "middleware bound the caller's session, and the streamable_http manager runs "
-    "that lifespan inside the request task — so the lifespan session shadows the "
-    "middleware's ContextVar binding and every HTTP request runs as the "
-    "service/dev-admin identity instead of the caller. The bearer session never "
-    "reaches the tools. Remove this xfail once the middleware session wins."
-)
-
-
 # ─── ASGI lifespan driver (asgi-lifespan pattern, no extra dep) ────────────────
 
 class _LifespanManager:
@@ -177,9 +161,9 @@ async def mcp_app_client(monkeypatch):
     All env / ``db_module.DB_DIR`` mutation is done via ``monkeypatch`` so it is
     scoped to this test and cannot leak into other test modules (see the module
     header note). MCP_DEV_MODE=true + SAIRO_API_TOKEN="" makes the per-request
-    lifespan bind the dev-admin session, which is the configuration that exposes
-    the known ContextVar-override bug — so the xfail markers reflect reality
-    whether this file runs alone or as part of the full suite.
+    lifespan bind a dev-admin session; this is the adversarial configuration T8
+    must stay correct under — the bearer middleware's caller session must still
+    win over the lifespan-bound dev-admin session.
     """
     # Env for the per-request lifespan (read at request time, so monkeypatch works).
     monkeypatch.setenv("SAIRO_API_URL", "http://localhost:9999")
@@ -289,8 +273,9 @@ async def test_t2_viewer_bearer_lists_only_authorized_bucket(mcp_app_client):
     ``list_buckets`` with ALPHA_TOKEN must return ONLY ``alpha`` (the caller has
     ``{alpha: read}``). This proves: middleware built the alpha-viewer session →
     bound it to the per-request ContextVar → ``list_buckets`` read
-    ``current_session()`` → ``can_read_bucket`` filtered to alpha. If the
-    session leaks (bug) the caller appears as admin and ``beta`` shows up too.
+    ``current_session()`` → ``can_read_bucket`` filtered to alpha. This is an
+    enforced regression guard: if a future change leaks the session and the
+    caller appears as admin, ``beta`` shows up too and this test fails.
     """
     r = await _tools_call(mcp_app_client, "list_buckets", {}, ALPHA_TOKEN)
     kind, payload = _result_text(r)
@@ -392,11 +377,6 @@ async def test_t8_concurrent_contextvar_isolation(mcp_app_client):
     must see ONLY its own bucket. If a future change (SDK bump, middleware
     rewrite, task-group re-parenting) breaks per-request ContextVar isolation,
     the two sessions bleed and BOTH requests see BOTH buckets → this test fails.
-
-    (Currently xfailed because of the per-request-lifespan override bug: every
-    HTTP request runs as the dev/service admin, so both callers see both
-    buckets. Once the bearer session wins, un-xfail to make this the live
-    isolation guard.)
     """
     async def call(token):
         return await _tools_call(mcp_app_client, "list_buckets", {}, token)
