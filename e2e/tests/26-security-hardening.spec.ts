@@ -16,6 +16,7 @@ test.describe('Security Hardening', () => {
       expect(csp).toContain("default-src 'self'");
       expect(csp).toContain("script-src 'self'");
       expect(csp).toContain("'wasm-unsafe-eval'");
+      expect(csp).toContain("extensions.duckdb.org");
       expect(csp).toContain("frame-src blob:");
     });
 

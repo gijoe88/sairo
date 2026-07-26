@@ -716,6 +716,11 @@ class TestSecurityHeaders:
         # browser blocks WebAssembly.instantiateStreaming() and the SQL tab
         # hangs forever on its loading spinner.
         assert "'wasm-unsafe-eval'" in csp
+        # Required for the duckdb-wasm SQL tab: duckdb-wasm 1.32.0 dynamically
+        # loads its parquet extension from this CDN; without it in connect-src
+        # the fetch is blocked and the SQL tab fails with a wasm signature
+        # mismatch.
+        assert "extensions.duckdb.org" in csp
 
     def test_x_content_type_options(self, client):
         """All responses should include X-Content-Type-Options: nosniff."""

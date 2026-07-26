@@ -90,6 +90,14 @@ async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
 
 # ── Security Headers Middleware ────────────────────────────────────────────
 
+# The default duckdb-wasm extension repository. duckdb-wasm 1.32.0 dynamically
+# loads the parquet reader (and other extensions) from this CDN at first use
+# rather than statically linking them; CSP connect-src must allow it or the
+# fetch is silently blocked and the SQL tab fails with a wasm signature
+# mismatch. If the extension repository is ever reconfigured (self-hosted,
+# mirrored, or a future duckdb-wasm default change), update this to match.
+_DUCKDB_EXTENSION_REPO = "https://extensions.duckdb.org"
+
 def _csp_connect_origins():
     """Origins the browser is allowed to XHR to, beyond 'self' — every configured S3
     endpoint. Direct (presigned) uploads PUT straight from the browser to the S3
@@ -113,7 +121,11 @@ def _csp_connect_origins():
 @app.middleware("http")
 async def security_headers_middleware(request: Request, call_next):
     response = await call_next(request)
-    connect_src = ("connect-src 'self' " + _csp_connect_origins()).rstrip()
+    connect_src = (
+        "connect-src 'self' "
+        + _DUCKDB_EXTENSION_REPO + " "
+        + _csp_connect_origins()
+    ).rstrip()
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         "script-src 'self' 'wasm-unsafe-eval'; "
