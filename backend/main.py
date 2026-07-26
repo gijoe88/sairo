@@ -951,14 +951,17 @@ def _validate_name(name: str, label: str = "name"):
 
 def _db_path(bucket, endpoint_id=None):
     eid = endpoint_id or _current_endpoint_id()
-    # Sanitize names used in file paths
+    # Sanitize names used in file paths. Every per-bucket DB is namespaced with
+    # a `bucket_` prefix so that NO bucket name can ever collide with the auth DB
+    # `users.db` (or any future reserved stem). e.g. a bucket literally named
+    # "users" maps to `bucket_users.db`, never `users.db`.
     safe_bucket = bucket.replace("/", "_").replace("..", "")
     if eid and eid != "default":
         safe_eid = eid.replace("/", "_").replace("..", "")
-        path = os.path.join(DB_DIR, f"{safe_eid}_{safe_bucket}.db")
+        path = os.path.join(DB_DIR, f"bucket_{safe_eid}_{safe_bucket}.db")
     else:
-        path = os.path.join(DB_DIR, f"{safe_bucket}.db")
-    # Verify the resolved path is inside DB_DIR
+        path = os.path.join(DB_DIR, f"bucket_{safe_bucket}.db")
+    # Verify the resolved path is inside DB_DIR (keep existing realpath defense)
     real_path = os.path.realpath(path)
     real_db_dir = os.path.realpath(DB_DIR)
     if not real_path.startswith(real_db_dir + os.sep) and real_path != real_db_dir:
@@ -2401,6 +2404,12 @@ def _auto_recrawl():
 
 @app.on_event("startup")
 def startup():
+    # One-time migration: rename legacy per-bucket DB files into the reserved
+    # `bucket_` namespace BEFORE any bucket DB is opened (the auto-crawl below
+    # and any per-request access must see the new names). Gated by instance_meta
+    # key 'db_namespace_v1' → no-op after the first successful boot.
+    _migrate_bucket_db_namespace()
+
     # Load all S3 endpoints from DB and register with manager (migrate plaintext → encrypted)
     try:
         with _get_users_db() as db:
@@ -2582,6 +2591,54 @@ def _meta_set(key: str, value: str):
             db.commit()
     except Exception:
         pass
+
+
+def _migrate_bucket_db_namespace():
+    """One-time idempotent migration: rename legacy per-bucket DB files into the
+    reserved `bucket_` namespace so no bucket name can collide with `users.db`.
+    Gated by instance_meta key 'db_namespace_v1' so it runs exactly once across
+    restarts. Safe to re-run: skips reserved files, already-prefixed files, and
+    any target that already exists (partial-migration safe).
+    """
+    if _meta_get("db_namespace_v1"):
+        return  # already migrated
+    if not os.path.isdir(DB_DIR):
+        _meta_set("db_namespace_v1", "1")
+        return
+    real_db_dir = os.path.realpath(DB_DIR)
+    try:
+        entries = os.listdir(real_db_dir)
+    except OSError:
+        return
+    # Reserved filenames that must NEVER be renamed/touched. Today only the auth
+    # DB; structured as a set so future reserved stems are easy to add.
+    reserved = {"users.db"}
+    for fname in entries:
+        # Only the MAIN db file here (e.g. "foo.db"); its -wal/-shm sidecars are
+        # renamed together with it via the ext loop below. Sidecar files themselves
+        # do not end with ".db" so they are not picked up in this iteration.
+        if not fname.endswith(".db"):
+            continue
+        if fname in reserved:
+            continue
+        if fname.startswith("bucket_"):
+            continue  # already on the new namespace
+        old_base = os.path.join(real_db_dir, fname)
+        new_base = os.path.join(real_db_dir, "bucket_" + fname)
+        # Rename the main file and its -wal/-shm sidecars as a group. Skip any
+        # target that already exists so a partial earlier run is not clobbered.
+        for ext in ("", "-wal", "-shm"):
+            src = old_base + ext
+            dst = new_base + ext
+            if not os.path.exists(src):
+                continue
+            if os.path.exists(dst):
+                continue
+            try:
+                os.replace(src, dst)
+            except OSError as e:
+                log.warning("db-namespace migration: could not rename %s -> %s: %s", src, dst, e)
+    _meta_set("db_namespace_v1", "1")
 
 
 def _iso_now() -> str:
@@ -4802,9 +4859,18 @@ def create_bucket(req: CreateBucketRequest, user: dict = Depends(require_admin))
 
 @app.delete("/api/buckets/{bucket}")
 def delete_bucket(bucket: str, user: dict = Depends(require_admin)):
+    db_file = _db_path(bucket)
+    users_db = _users_db_path()
+    # Defense-in-depth: never let a bucket delete touch the auth DB. With the
+    # `bucket_` namespace this can't happen for a real bucket, but reject
+    # explicitly (reserved name OR resolved-path collision) so a future regression
+    # that removes the prefix can never os.remove users.db.
+    safe_bucket = bucket.replace("/", "_").replace("..", "")
+    if f"{safe_bucket}.db" in {"users.db"} or \
+            os.path.realpath(db_file) == os.path.realpath(users_db):
+        raise HTTPException(400, "Refusing to delete a reserved/system database")
     s3.delete_bucket(Bucket=bucket)
     # Remove index DB
-    db_file = _db_path(bucket)
     for ext in ["", "-wal", "-shm"]:
         try:
             os.remove(db_file + ext)

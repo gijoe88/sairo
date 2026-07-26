@@ -2838,3 +2838,206 @@ class TestParquetStreamEndpoint:
             )
 
         asyncio.run(drive())
+
+
+# ── Per-bucket DB namespace hardening (F2) ────────────────
+# Regression: a bucket named `users` used to collide with the auth DB `users.db`,
+# so `DELETE /api/buckets/users` would os.remove the entire auth DB. Fix =
+# reserve a `bucket_` namespace for every per-bucket DB + a one-time idempotent
+# migration + a defense-in-depth 400 guard on the delete path.
+
+class TestBucketDbNamespace:
+    def test_delete_users_bucket_rejected_and_auth_db_intact(self, client, admin_cookies):
+        """DELETE /api/buckets/users must 400 and leave users.db byte-identical."""
+        m = _main_module()
+        import sqlite3
+
+        def _snapshot(path):
+            try:
+                with open(path, "rb") as fh:
+                    return hashlib.sha256(fh.read()).hexdigest()
+            except FileNotFoundError:
+                return None
+
+        users_db = m._users_db_path()
+        before = {ext: _snapshot(users_db + ext) for ext in ("", "-wal", "-shm")}
+
+        resp = client.delete("/api/buckets/users", cookies=admin_cookies)
+        assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text}"
+
+        # Auth DB must be byte-identical (no os.remove occurred) for the main file
+        # and any WAL/SHM sidecars present before the call.
+        after = {ext: _snapshot(users_db + ext) for ext in ("", "-wal", "-shm")}
+        for ext, h in before.items():
+            if h is not None:
+                assert after[ext] == h, f"users.db{ext} changed after rejected delete"
+        # The main auth DB file must definitely still exist.
+        assert os.path.exists(users_db), "users.db was deleted by the rejected call!"
+        # A `bucket_users.db` index (if any) is irrelevant — the auth DB is what matters.
+
+    def test_db_path_namespaces_with_bucket_prefix(self):
+        """_db_path must prefix every per-bucket DB with `bucket_`."""
+        m = _main_module()
+        # Default endpoint → bucket_<name>.db
+        assert m._db_path("mybucket").endswith("bucket_mybucket.db")
+        # Non-default endpoint → bucket_<eid>_<name>.db
+        assert m._db_path("mybucket", "ep1").endswith("bucket_ep1_mybucket.db")
+        # The whole point: a bucket literally named "users" can never equal users.db
+        users_bucket = m._db_path("users")
+        assert users_bucket.endswith("bucket_users.db")
+        assert users_bucket != m._users_db_path()
+
+    def test_migration_renames_legacy_files_once_and_idempotent(self):
+        """The one-time migration renames legacy DB files into the `bucket_` namespace,
+        is idempotent, and never touches users.db."""
+        m = _main_module()
+        import sqlite3
+
+        db_dir = m.DB_DIR
+
+        try:
+            # The app fixture already triggered startup() (marker set). Clear it so we
+            # can drive the migration directly. DELETE is a no-op if the row is absent.
+            with m._get_users_db() as db:
+                db.execute("DELETE FROM instance_meta WHERE key='db_namespace_v1'")
+                db.commit()
+
+            # Seed legacy per-bucket DB files (main + WAL/SHM sidecars) and a
+            # multi-endpoint-prefixed legacy file. Empty files are fine — the
+            # migration only renames, it never opens them.
+            for ext in ("", "-wal", "-shm"):
+                open(os.path.join(db_dir, f"oldbucket.db{ext}"), "wb").close()
+            open(os.path.join(db_dir, "ep2_other.db"), "wb").close()
+
+            users_db = m._users_db_path()
+
+            def _auth_rows():
+                # Structural snapshot of the auth DB. The migration legitimately
+                # writes the marker into instance_meta (which lives in users.db), so
+                # byte-identity does NOT hold — instead prove the auth data survives.
+                conn = sqlite3.connect(users_db)
+                rows = conn.execute("SELECT username, role FROM users ORDER BY username").fetchall()
+                conn.close()
+                return rows
+
+            users_before = _auth_rows()
+
+            # ---- First run: legacy files get renamed into the namespace ----
+            m._migrate_bucket_db_namespace()
+
+            # main + sidecars renamed
+            for ext in ("", "-wal", "-shm"):
+                assert not os.path.exists(os.path.join(db_dir, f"oldbucket.db{ext}")), \
+                    f"legacy oldbucket.db{ext} should have been renamed"
+                assert os.path.exists(os.path.join(db_dir, f"bucket_oldbucket.db{ext}")), \
+                    f"bucket_oldbucket.db{ext} should exist after migration"
+            # multi-endpoint legacy file renamed
+            assert not os.path.exists(os.path.join(db_dir, "ep2_other.db"))
+            assert os.path.exists(os.path.join(db_dir, "bucket_ep2_other.db"))
+            # users.db untouched (reserved): still at the same path, NOT renamed
+            # into the namespace, and its auth rows survive intact.
+            assert os.path.exists(users_db), "users.db must not be renamed/removed"
+            assert not os.path.exists(os.path.join(db_dir, "bucket_users.db")), \
+                "users.db must NOT be renamed into the namespace"
+            assert _auth_rows() == users_before, "auth rows changed during migration"
+            # marker is now set
+            assert m._meta_get("db_namespace_v1"), "migration marker should be set after run"
+
+            # ---- Idempotency run #1: clear marker, re-run → no further renames ----
+            with m._get_users_db() as db:
+                db.execute("DELETE FROM instance_meta WHERE key='db_namespace_v1'")
+                db.commit()
+            m._migrate_bucket_db_namespace()  # nothing left to rename; no error
+            # legacy names still gone (not recreated), namespaced names still present
+            assert not os.path.exists(os.path.join(db_dir, "oldbucket.db"))
+            assert os.path.exists(os.path.join(db_dir, "bucket_oldbucket.db"))
+            assert _auth_rows() == users_before, "auth rows changed on idempotent re-run"
+            assert m._meta_get("db_namespace_v1"), "marker should be re-set after idempotent run"
+
+            # ---- Idempotency run #2: do NOT clear marker → early-return no-op ----
+            m._migrate_bucket_db_namespace()
+            assert os.path.exists(os.path.join(db_dir, "bucket_oldbucket.db"))
+            assert _auth_rows() == users_before
+        finally:
+            # CLEANUP: remove every file we produced (legacy + namespaced, main +
+            # sidecars) so the shared /tmp/sairo-test dir is not polluted for other
+            # tests. Iterate base names × {-wal,-shm,""}.
+            cleanup_bases = {"oldbucket.db", "bucket_oldbucket.db", "ep2_other.db", "bucket_ep2_other.db"}
+            for base in cleanup_bases:
+                for ext in ("", "-wal", "-shm"):
+                    try:
+                        os.remove(os.path.join(db_dir, base + ext))
+                    except FileNotFoundError:
+                        pass
+            # Re-run migration to restore the marker (leave shared state consistent).
+            try:
+                m._migrate_bucket_db_namespace()
+            except Exception:
+                pass
+
+    def test_non_reserved_bucket_still_works_after_migration(self):
+        """After migration, a normal (non-`users`) bucket index still initializes and reads."""
+        m = _main_module()
+        import sqlite3
+
+        bucket = "regulartest"
+        db_file = m._db_path(bucket)  # ends with bucket_regulartest.db
+        try:
+            assert db_file.endswith("bucket_regulartest.db")
+            m._init_db(bucket)  # creates objects table etc.
+            assert os.path.exists(db_file), "bucket_regulartest.db should exist after _init_db"
+            # A read against the objects table should work (table exists, empty).
+            conn = sqlite3.connect(db_file)
+            count = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
+            conn.close()
+            assert count == 0
+        finally:
+            for ext in ("", "-wal", "-shm"):
+                try:
+                    os.remove(db_file + ext)
+                except FileNotFoundError:
+                    pass
+
+    def test_non_reserved_bucket_list_endpoint_reads_namespaced_db(self, client, admin_cookies):
+        """End-to-end: after the namespace fix, GET /api/buckets/{b}/list serves the
+        object index from `bucket_{b}.db` (not the legacy unprefixed path, never users.db).
+        Seeds one object so _is_index_ready() is True → the endpoint uses the index
+        (no S3 fallback required)."""
+        m = _main_module()
+        bucket = "f2e2elist"
+        db_file = m._db_path(bucket)
+        try:
+            # The index must live at the namespaced path.
+            assert db_file.endswith("bucket_f2e2elist.db"), db_file
+            # Build the index and seed exactly one object at the root prefix.
+            m._init_db(bucket)
+            with m._get_db(bucket) as db:
+                db.execute(
+                    "INSERT INTO objects (key,size,last_modified,etag,prefix,depth) "
+                    "VALUES (?,?,?,?,?,?)",
+                    ("hello.txt", 123, "2026-07-26T00:00:00Z", '"etag1"', "", 0),
+                )
+                db.commit()
+            assert m._is_index_ready(bucket), "seeded index should be ready"
+
+            # The HTTP list path must resolve to the same namespaced DB and return
+            # the seeded object (indexed=True → index was used, not S3 streaming).
+            resp = client.get(f"/api/buckets/{bucket}/list", cookies=admin_cookies)
+            assert resp.status_code == 200, resp.text
+            lines = [json.loads(ln) for ln in resp.text.splitlines() if ln.strip()]
+            assert lines, "list endpoint returned no ndjson lines"
+            payload = lines[0]
+            assert payload.get("indexed") is True, f"expected index path, got {payload}"
+            keys = {f["key"] for f in payload.get("files", [])}
+            assert "hello.txt" in keys, f"hello.txt missing from files: {keys}"
+
+            # Defense-in-depth sanity: a `users`-named index path can never be the
+            # auth DB, and the just-used file is provably distinct from users.db.
+            assert m._db_path("users") != m._users_db_path()
+            assert m._db_path("users").endswith("bucket_users.db")
+        finally:
+            for ext in ("", "-wal", "-shm"):
+                try:
+                    os.remove(db_file + ext)
+                except FileNotFoundError:
+                    pass
