@@ -31,6 +31,11 @@ def current_session() -> UserSession:
     return session
 
 
+def has_session() -> bool:
+    """True if a session is already bound to the current context."""
+    return _request_session.get() is not None
+
+
 def set_session(session: UserSession):
     """Bind ``session`` to the current context and return the reset token."""
     return _request_session.set(session)

@@ -25,7 +25,7 @@ from auth import AuthManager, AuthorizationError, UserSession
 from db import close_all as close_db_pool
 from observability import logger, metrics
 from sairo_client import SairoClient
-from session_ctx import reset_session, set_session
+from session_ctx import has_session, reset_session, set_session
 
 # --- Configuration ---
 
@@ -182,10 +182,12 @@ async def lifespan(server: FastMCP):
             token="",
         )
 
-    # Bind the bootstrap session to the process-default context so stdio / the
-    # in-memory test transport populate current_session() for child tasks. The
-    # HTTP middleware sets/resets this per-request on top of this default.
-    if session is not None:
+    # Only bind the bootstrap session when none is already bound. On the HTTP
+    # path the bearer middleware binds the caller's session per-request (and
+    # this lifespan runs inside that request's task, inheriting that binding);
+    # on the stdio / in-memory path nothing else binds one, so the bootstrap
+    # session applies there.
+    if session is not None and not has_session():
         set_session(session)
 
     try:
