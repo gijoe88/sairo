@@ -30,14 +30,17 @@ def _resolve_db_path(bucket: str, endpoint_id: Optional[str] = None) -> str:
     """
     Resolve the SQLite database path for a bucket.
     Mirrors Sairo's _db_path() logic with path traversal protection.
+
+    Every per-bucket DB is namespaced with a `bucket_` prefix so that no bucket
+    name can collide with the auth DB `users.db` (e.g. a bucket named "users"
+    resolves to `bucket_users.db`, never `users.db`).
     """
+    safe_bucket = _safe_name(bucket)
     if endpoint_id and endpoint_id != "default":
         safe_eid = _safe_name(endpoint_id)
-        safe_bucket = _safe_name(bucket)
-        filename = f"{safe_eid}_{safe_bucket}.db"
+        filename = f"bucket_{safe_eid}_{safe_bucket}.db"
     else:
-        safe_bucket = _safe_name(bucket)
-        filename = f"{safe_bucket}.db"
+        filename = f"bucket_{safe_bucket}.db"
 
     db_path = os.path.join(DB_DIR, filename)
     real_path = os.path.realpath(db_path)
@@ -138,15 +141,20 @@ def list_bucket_dbs() -> list[dict]:
             continue
 
         filepath = os.path.join(real_db_dir, filename)
-        name = filename[:-3]  # strip .db
-
-        if "_" in name:
-            parts = name.split("_", 1)
+        stem = filename[:-3]  # strip ".db"
+        # Strip exactly ONE `bucket_` namespace prefix when present. Legacy
+        # un-prefixed files (pre-migration) are parsed as-is for robustness
+        # across the migration window. NOTE: the split-on-first-`_` parsing
+        # preserves the pre-existing eid/bucket ambiguity and is out of scope.
+        if stem.startswith("bucket_"):
+            stem = stem[len("bucket_"):]
+        if "_" in stem:
+            parts = stem.split("_", 1)
             endpoint_id = parts[0]
             bucket = parts[1]
         else:
             endpoint_id = "default"
-            bucket = name
+            bucket = stem
 
         try:
             size = os.path.getsize(filepath)

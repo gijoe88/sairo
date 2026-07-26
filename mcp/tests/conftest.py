@@ -34,7 +34,9 @@ def test_db_dir():
 
 def _create_test_bucket_db(db_dir: str, bucket: str, num_objects: int = 100):
     """Create a test bucket database with realistic data."""
-    db_path = os.path.join(db_dir, f"{bucket}.db")
+    # Mirror backend `_db_path` / `_resolve_db_path`: every per-bucket DB lives in
+    # the reserved `bucket_` namespace so no bucket name can collide with users.db.
+    db_path = os.path.join(db_dir, f"bucket_{bucket}.db")
     conn = sqlite3.connect(db_path)
 
     # Create tables matching Sairo's schema
