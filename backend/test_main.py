@@ -857,3 +857,239 @@ class TestCompatPermissions:
                          "/api/presigned-url?key=test", "/api/multipart-uploads"]:
                 resp = fresh.get(path)
                 assert resp.status_code == 401, f"{path} should require auth, got {resp.status_code}"
+
+
+# ── PR 9: auth-mode guard, cookie/DB validation, 2FA entropy, OAuth state ────
+#
+# F4: /api/auth/login-s3 gated on AUTH_MODE=s3
+# F7: cookie sessions re-validated against the users table on each request
+# L4: 64-bit (16 hex) 2FA recovery codes
+# L5: oauth_state cookie cleared after the OAuth exchange (success + 2FA)
+
+
+def _cookie_deletion_set(headers, name: str, path: str) -> bool:
+    """True if the response carries a Set-Cookie header that *deletes* `name`
+    scoped to `path` (empty value + Max-Age=0). Used to assert that an auth
+    flow clears a state cookie."""
+    # httpx.Headers exposes multi-valued headers via get_list (not getlist).
+    get_all = getattr(headers, "get_list", None) or getattr(headers, "getlist", None)
+    for sc in (get_all("set-cookie") if get_all else []):
+        if sc.startswith(f"{name}=") and f"Path={path}" in sc and "Max-Age=0" in sc:
+            return True
+    return False
+
+
+class TestS3LoginModeGuard:
+    """F4: in local mode the S3 login route must be unreachable (it otherwise
+    hands a local-admin cookie to anyone holding the server's S3 service-account
+    credentials)."""
+
+    def test_login_s3_rejected_in_local_mode(self, client, monkeypatch):
+        m = _main_module()
+        monkeypatch.setattr(m, "AUTH_MODE", "local")
+        resp = client.post(
+            "/api/auth/login-s3",
+            json={"access_key": "AKIATEST123456", "secret_key": "secretkey1234"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 404
+
+    def test_login_s3_allowed_in_s3_mode(self, app, monkeypatch):
+        """In s3 mode the guard lets the request through; with boto3 mocked by
+        the app fixture, list_buckets() succeeds and a session is issued."""
+        m = _main_module()
+        monkeypatch.setattr(m, "AUTH_MODE", "s3")
+        with TestClient(app) as c:
+            resp = c.post(
+                "/api/auth/login-s3",
+                json={"access_key": "AKIATEST123456", "secret_key": "secretkey1234"},
+                follow_redirects=False,
+            )
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            assert data["username"].startswith("s3:")
+            assert data["role"] == "admin"
+            assert resp.cookies.get("access_token"), "session cookie should be issued"
+
+
+class TestCookieSessionDBValidation:
+    """F7: a cookie session is re-checked against the users table on every
+    request, so a deleted user fails immediately and a demoted admin's role
+    updates on the next request (mirrors the API-token path)."""
+
+    def test_deleted_user_cookie_is_rejected(self, app, client, admin_cookies):
+        m = _main_module()
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": "f7-deleted", "password": "pw12345678", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        with TestClient(app) as c:
+            login = c.post("/api/auth/login",
+                           json={"username": "f7-deleted", "password": "pw12345678"})
+            assert login.status_code == 200
+            cookie = {"access_token": login.cookies.get("access_token")}
+            # Cookie is honored while the user exists.
+            me = c.get("/api/auth/me", cookies=cookie)
+            assert me.status_code == 200
+            assert me.json()["username"] == "f7-deleted"
+            # Remove the user directly in the DB (cookie still has ~SESSION_HOURS left).
+            with m._get_users_db() as db:
+                db.execute("DELETE FROM users WHERE username=?", ("f7-deleted",))
+                db.commit()
+            # Same cookie must now be rejected — not honored until expiry.
+            me2 = c.get("/api/auth/me", cookies=cookie)
+            assert me2.status_code == 401
+
+    def test_demoted_admin_role_updates_and_admin_route_blocks(self, app, client, admin_cookies):
+        m = _main_module()
+        resp = client.post(
+            "/api/auth/users",
+            json={"username": "f7-demoted", "password": "pw12345678", "role": "admin"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        with TestClient(app) as c:
+            login = c.post("/api/auth/login",
+                           json={"username": "f7-demoted", "password": "pw12345678"})
+            assert login.status_code == 200
+            cookie = {"access_token": login.cookies.get("access_token")}
+            # Initially admin — admin-gated route works.
+            me = c.get("/api/auth/me", cookies=cookie)
+            assert me.status_code == 200 and me.json()["role"] == "admin"
+            assert c.get("/api/health-detail", cookies=cookie).status_code == 200
+            # Demote to viewer directly in the DB.
+            with m._get_users_db() as db:
+                db.execute("UPDATE users SET role=? WHERE username=?",
+                           ("viewer", "f7-demoted"))
+                db.commit()
+            # Next request reflects the demotion (cookie still encodes 'admin').
+            me2 = c.get("/api/auth/me", cookies=cookie)
+            assert me2.status_code == 200
+            assert me2.json()["role"] == "viewer"
+            # And the admin-gated route now forbids the demoted session.
+            assert c.get("/api/health-detail", cookies=cookie).status_code == 403
+
+    def test_live_user_cookie_still_works(self, app, client, admin_cookies):
+        """Sanity: the DB check must not break a live, unmodified user's cookie."""
+        client.post(
+            "/api/auth/users",
+            json={"username": "f7-live", "password": "pw12345678", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        with TestClient(app) as c:
+            login = c.post("/api/auth/login",
+                           json={"username": "f7-live", "password": "pw12345678"})
+            assert login.status_code == 200
+            me = c.get("/api/auth/me",
+                       cookies={"access_token": login.cookies.get("access_token")})
+            assert me.status_code == 200
+            assert me.json()["role"] == "viewer"
+
+    def test_s3_session_cookie_not_subject_to_db_lookup(self, app, monkeypatch):
+        """F7 correctness refinement: an s3: session has no users row and must
+        bypass the DB lookup (else every S3 request would 401)."""
+        import jwt as _jwt
+        m = _main_module()
+        monkeypatch.setattr(m, "AUTH_MODE", "s3")
+        with TestClient(app) as c:
+            resp = c.post(
+                "/api/auth/login-s3",
+                json={"access_key": "AKIATESTS3MODE", "secret_key": "secretkey1234"},
+                follow_redirects=False,
+            )
+            assert resp.status_code == 200, resp.text
+            token = resp.cookies.get("access_token")
+            assert token
+            # No users row exists for 's3:AKIATEST...' — /me must still succeed.
+            me = c.get("/api/auth/me", cookies={"access_token": token})
+            assert me.status_code == 200
+            assert me.json()["username"].startswith("s3:")
+            assert me.json()["role"] == "admin"
+            # And the sub indeed carries the s3: prefix the exemption keys on.
+            claims = _jwt.decode(token, m.JWT_SECRET, algorithms=["HS256"])
+            assert claims["sub"].startswith("s3:")
+
+
+class TestTwoFactorRecoveryEntropy:
+    """L4: recovery codes must be 64-bit (16 hex chars), not 32-bit (8 hex)."""
+
+    def test_recovery_codes_are_16_hex_chars(self, app, client, admin_cookies):
+        import re
+        import pyotp
+        m = _main_module()
+        # Use a dedicated user so the shared admin is not 2FA-locked for later tests.
+        client.post(
+            "/api/auth/users",
+            json={"username": "f7-2fa", "password": "pw12345678", "role": "viewer"},
+            cookies=admin_cookies,
+        )
+        with TestClient(app) as c:
+            assert c.post("/api/auth/login",
+                          json={"username": "f7-2fa", "password": "pw12345678"}).status_code == 200
+            secret = c.post("/api/auth/2fa/setup").json()["secret"]
+            code = pyotp.TOTP(secret).now()
+            resp = c.post("/api/auth/2fa/enable", json={"code": code})
+            assert resp.status_code == 200, resp.text
+            codes = resp.json()["recovery_codes"]
+            assert len(codes) == 10
+            hex16 = re.compile(r"^[0-9a-f]{16}$")
+            for value in codes:
+                assert hex16.match(value), f"recovery code not 16 hex chars: {value!r}"
+
+
+class TestOAuthStateCookieCleared:
+    """L5: the OAuth callback must clear the oauth_state cookie on both the
+    success and 2FA branches (mirrors the OIDC callback's oidc_state cleanup)."""
+
+    def _enable_google(self, monkeypatch):
+        m = _main_module()
+        monkeypatch.setattr(m, "OAUTH_GOOGLE_CLIENT_ID", "g-client-id")
+        monkeypatch.setattr(m, "OAUTH_GOOGLE_CLIENT_SECRET", "g-secret")
+        monkeypatch.setattr(m, "OAUTH_ALLOWED_DOMAINS", [])
+        return m
+
+    def _stub_google_userinfo(self, monkeypatch, email):
+        from types import SimpleNamespace
+        monkeypatch.setattr("httpx.post", lambda *a, **k: SimpleNamespace(
+            status_code=200, json=lambda: {"access_token": "AT"}))
+        monkeypatch.setattr("httpx.get", lambda *a, **k: SimpleNamespace(
+            status_code=200, json=lambda: {"email": email}))
+
+    def test_success_branch_deletes_oauth_state(self, app, monkeypatch):
+        m = self._enable_google(monkeypatch)
+        self._stub_google_userinfo(monkeypatch, "oauthuser@corp.test")
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/google/callback?code=abc",
+                         follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert resp.headers["location"] == "/"
+            assert resp.cookies.get("access_token"), "session cookie should be issued"
+            assert _cookie_deletion_set(resp.headers, "oauth_state", "/api/auth/oauth")
+        # The synced OAuth user exists (username is the email local-part).
+        with m._get_users_db() as db:
+            row = db.execute("SELECT role, auth_source FROM users WHERE username=?",
+                             ("oauthuser",)).fetchone()
+            assert row is not None and row["role"] == "viewer"
+            assert (row["auth_source"] or "") == "oauth"
+
+    def test_2fa_branch_deletes_oauth_state(self, app, monkeypatch):
+        m = self._enable_google(monkeypatch)
+        # Pre-create an OAuth user with 2FA already enabled so the callback takes
+        # the 2FA branch (INSERT OR REPLACE keeps the test re-runnable in-process).
+        with m._get_users_db() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO users "
+                "(username, password_hash, role, auth_source, totp_enabled) "
+                "VALUES (?, ?, ?, ?, 1)",
+                ("oauth2fa", "OAUTH:placeholder", "viewer", "oauth"))
+            db.commit()
+        self._stub_google_userinfo(monkeypatch, "oauth2fa@corp.test")
+        with TestClient(app) as c:
+            resp = c.get("/api/auth/oauth/google/callback?code=abc",
+                         follow_redirects=False)
+            assert resp.status_code in (302, 307)
+            assert "requires_2fa=true" in resp.headers["location"]
+            assert resp.cookies.get("access_token"), "pending 2FA cookie should be issued"
+            assert _cookie_deletion_set(resp.headers, "oauth_state", "/api/auth/oauth")

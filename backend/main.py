@@ -734,7 +734,23 @@ def get_current_user(request: Request):
         # Reject 2FA pending tokens for normal endpoints
         if payload.get("purpose") == "2fa":
             raise HTTPException(401, "2FA verification required")
-        return {"username": payload["sub"], "role": payload["role"]}
+        sub = payload["sub"]
+        if sub.startswith("s3:"):
+            # S3-key sessions are authenticated by their encrypted IAM credentials
+            # (see _extract_s3_session), NOT the users table — they have no row
+            # there, so a DB lookup must not run for them.
+            return {"username": sub, "role": payload["role"]}
+        # Local/LDAP/OAuth/OIDC sessions: the DB is authoritative for existence
+        # and role. A deleted user's cookie must fail immediately (not at
+        # SESSION_HOURS), and a demoted admin's role must update on the next
+        # request. This mirrors the API-token path (_verify_api_token JOINs
+        # users). One indexed PK lookup per request — cheap.
+        with _get_users_db() as db:
+            row = db.execute(
+                "SELECT role FROM users WHERE username=?", (sub,)).fetchone()
+        if not row:
+            raise HTTPException(401, "User no longer exists")
+        return {"username": sub, "role": row["role"]}
     except jwt.ExpiredSignatureError:
         raise HTTPException(401, "Session expired")
     except jwt.InvalidTokenError:
@@ -2906,6 +2922,8 @@ def auth_login_s3(req: LoginS3Request, request: Request):
     Calls list_buckets() with the provided access key / secret key.
     If it succeeds, the credentials are valid and the user gets an admin session.
     """
+    if AUTH_MODE != "s3":
+        raise HTTPException(404, "S3 login is not enabled")
     _check_login_rate(request.client.host)
     if not req.access_key or not req.secret_key:
         raise HTTPException(400, "Access key and secret key are required")
@@ -3099,7 +3117,7 @@ def twofa_enable(req: TwoFactorVerifyRequest, user: dict = Depends(get_current_u
     if not totp.verify(req.code, valid_window=1):
         raise HTTPException(400, "Invalid TOTP code")
     # Generate 10 recovery codes
-    recovery_plain = [secrets.token_hex(4) for _ in range(10)]
+    recovery_plain = [secrets.token_hex(8) for _ in range(10)]  # 64-bit codes (16 hex chars)
     recovery_hashes = json.dumps([bcrypt.hash(c) for c in recovery_plain])
     with _get_users_db() as db:
         db.execute("UPDATE users SET totp_enabled=1, recovery_codes=? WHERE username=?",
@@ -3756,6 +3774,7 @@ def oauth_callback(provider: str, code: str, request: Request):
         _secure_cookie = os.environ.get("SECURE_COOKIE", "true").lower() != "false"
         response.set_cookie("access_token", pending_token, httponly=True, samesite="strict",
                             secure=_secure_cookie, max_age=300, path="/")
+        response.delete_cookie("oauth_state", path="/api/auth/oauth")
         return response
 
     # Issue JWT and redirect to app
@@ -3767,6 +3786,7 @@ def oauth_callback(provider: str, code: str, request: Request):
     _secure_cookie = os.environ.get("SECURE_COOKIE", "true").lower() != "false"
     response.set_cookie("access_token", token, httponly=True, samesite="strict",
                         secure=_secure_cookie, max_age=SESSION_HOURS * 3600, path="/")
+    response.delete_cookie("oauth_state", path="/api/auth/oauth")
     _audit("login", username, details=f"method=oauth_{provider}")
     return response
 
