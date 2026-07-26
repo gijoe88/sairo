@@ -1016,3 +1016,47 @@ class TestBucketDbNamespace:
                     os.remove(db_file + ext)
                 except FileNotFoundError:
                     pass
+
+    def test_non_reserved_bucket_list_endpoint_reads_namespaced_db(self, client, admin_cookies):
+        """End-to-end: after the namespace fix, GET /api/buckets/{b}/list serves the
+        object index from `bucket_{b}.db` (not the legacy unprefixed path, never users.db).
+        Seeds one object so _is_index_ready() is True → the endpoint uses the index
+        (no S3 fallback required)."""
+        m = _main_module()
+        bucket = "f2e2elist"
+        db_file = m._db_path(bucket)
+        try:
+            # The index must live at the namespaced path.
+            assert db_file.endswith("bucket_f2e2elist.db"), db_file
+            # Build the index and seed exactly one object at the root prefix.
+            m._init_db(bucket)
+            with m._get_db(bucket) as db:
+                db.execute(
+                    "INSERT INTO objects (key,size,last_modified,etag,prefix,depth) "
+                    "VALUES (?,?,?,?,?,?)",
+                    ("hello.txt", 123, "2026-07-26T00:00:00Z", '"etag1"', "", 0),
+                )
+                db.commit()
+            assert m._is_index_ready(bucket), "seeded index should be ready"
+
+            # The HTTP list path must resolve to the same namespaced DB and return
+            # the seeded object (indexed=True → index was used, not S3 streaming).
+            resp = client.get(f"/api/buckets/{bucket}/list", cookies=admin_cookies)
+            assert resp.status_code == 200, resp.text
+            lines = [json.loads(ln) for ln in resp.text.splitlines() if ln.strip()]
+            assert lines, "list endpoint returned no ndjson lines"
+            payload = lines[0]
+            assert payload.get("indexed") is True, f"expected index path, got {payload}"
+            keys = {f["key"] for f in payload.get("files", [])}
+            assert "hello.txt" in keys, f"hello.txt missing from files: {keys}"
+
+            # Defense-in-depth sanity: a `users`-named index path can never be the
+            # auth DB, and the just-used file is provably distinct from users.db.
+            assert m._db_path("users") != m._users_db_path()
+            assert m._db_path("users").endswith("bucket_users.db")
+        finally:
+            for ext in ("", "-wal", "-shm"):
+                try:
+                    os.remove(db_file + ext)
+                except FileNotFoundError:
+                    pass
