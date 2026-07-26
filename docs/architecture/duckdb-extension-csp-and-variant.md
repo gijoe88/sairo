@@ -3,8 +3,17 @@
 > Companion to `csp-wasm-instantiation.md` (which covered `script-src 'wasm-unsafe-eval'`
 > for the **compile** step). This doc covers the **fetch** step: allowing the duckdb
 > extension CDN in `connect-src`, and switching the duckdb-wasm variant from `eh` to `mvp`.
-> Code lives on `fix/duckdb-extension-csp-and-variant` (cut from `upstream-main`, CODE ONLY);
-> this doc is fork-only and stays on `main`.
+> Code lives on `fix/duckdb-extension-csp-and-variant` (**based on `main`**, CODE ONLY — see
+> the branching note below); this doc is fork-only and stays on `main`.
+
+> **Branching note.** The generic branch policy ("cut `fix/*` from `upstream-main`") applies to
+> *upstreamable* fixes. The duckdb-wasm SQL tab is **fork-only**: `frontend/src/lib/duckdb.js`,
+> `frontend/src/test/duckdb.test.js`, the `@duckdb/duckdb-wasm` dependency, and the D0
+> `wasm-unsafe-eval` CSP line all exist only on `main` (`git log upstream-main -- frontend/src/lib/duckdb.js`
+> is empty; `wasm-unsafe-eval` is absent from `upstream-main:backend/main.py`). D2 edits files that
+> do not exist on `upstream-main`, so the branch is based on `main` and the meaningful no-docs gate
+> is `git diff main...fix` (the `upstream-main...fix` diff would include the entire fork-only feature
+> and is not useful here). This mirrors the fork-only reality of the parquet-preview feature itself.
 
 ## Context
 
@@ -95,7 +104,7 @@ predigested **classic** IIFE bundle in 1.32.0 (`"use strict";var duckdb=(()=>{�
 top-level `import`/`export`). So `new Worker(workerUrl)` stays WITHOUT `{type:"module"}` — the
 "MUST-FIX 1" reasoning in the existing comment remains valid, just retargeted to the mvp file.
 
-## Change set (code — on `fix/duckdb-extension-csp-and-variant`, from `upstream-main`)
+## Change set (code — on `fix/duckdb-extension-csp-and-variant`, based on `main`)
 
 | File | Change |
 |---|---|
@@ -114,15 +123,17 @@ rebuilt image via `--pull always` on next deploy.
 
 ## Implementation sequence
 
-1. Cut `fix/duckdb-extension-csp-and-variant` from `upstream-main` (clean; CODE ONLY).
+1. Base `fix/duckdb-extension-csp-and-variant` on `main` (NOT `upstream-main` — the duckdb
+   SQL tab is fork-only; see the branching note at the top). CODE ONLY on this branch.
 2. D1 — backend CSP constant + `connect-src` wiring.
 3. D1 test — `backend/test_main.py` CSP assertion.
 4. D2 — frontend `lib/duckdb.js` import swap + comment updates.
 5. D2 test — `frontend/src/test/duckdb.test.js` mock paths.
 6. E2E — `26-security-hardening.spec.ts` CSP assertion.
 7. Verify locally: `pytest backend/`; `cd frontend && npm run build && npm test`.
-8. Gate: `git diff upstream-main...fix/duckdb-extension-csp-and-variant` must contain **no**
-   `docs/`, `AGENTS.md`, or `*.md` (branch policy).
+8. Gate: `git diff main...fix/duckdb-extension-csp-and-variant` must contain **no**
+   `docs/`, `AGENTS.md`, or `*.md` (branch policy). The `upstream-main...fix` diff is not
+   meaningful here because the feature is fork-only (see branching note).
 9. Merge `fix/duckdb-extension-csp-and-variant` → `main`.
 10. Commit this design doc on `main` (fork-only docs; separate from the code branch).
 11. Rebuild the sairo dev image; redeploy the sairo-dev tier.
