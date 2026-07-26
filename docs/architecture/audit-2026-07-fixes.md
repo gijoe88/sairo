@@ -264,18 +264,18 @@ Fork policy (also in `AGENTS.md`): every PR branch is cut from **`upstream-main`
 
 | PR | Branch (from `upstream-main`) | Contents | Depends on |
 |----|-------------------------------|----------|------------|
-| 5  | `chore/mcp-pin-bump` | §3: `mcp[cli]>=1.28.0,<2`. Tiny, urgent, lands before 2026-07-28. | — |
-| 6  | `fix/mcp-per-request-auth-v2` | F1 (the A7 re-do). Isolated to `mcp/`. Highest-risk; own review. | PR 5 (so the spike + tests run on 1.28.1) |
-
-> **Status (2026-07):** PR 5 pushed `origin/chore/mcp-pin-bump` @ `e6fcb6e` (code-only, 1 line, tests green on 1.28.1). PR 6 pushed `origin/fix/mcp-per-request-auth-v2` @ `c37d7ac` (6 commits, code-only, `pytest mcp/` 111 passed/75 skipped; spike PASSED — see §4.1.8). Neither opened upstream yet — `gh` unavailable in agent sessions; opening via the GitHub compare UI is queued for the user. PRs 7–10 not started.
-| 7  | `fix/bucket-db-namespace` | F2 (reserved-name/`bucket_` prefix + migration). | — (but coordinate with F3 if both touch `_db_path` lookups) |
+| 5  | `chore/mcp-pin-bump` | §3: `mcp[cli]>=1.28.0,<2`. Tiny, urgent, lands before 2026-07-28. **✅ pushed `e6fcb6e`** | — |
+| 6  | `fix/mcp-per-request-auth-v2` | F1 (the A7 re-do). Isolated to `mcp/`. Highest-risk; own review. **✅ pushed `c37d7ac`** | PR 5 (so the spike + tests run on 1.28.1) |
+| 7  | `fix/bucket-db-namespace` | F2 (reserved-name/`bucket_` prefix + migration). **✅ pushed `4cdc7e7`** | — |
 | 8  | `fix/endpoint-scoped-permissions` | F3 (`bucket_permissions.endpoint_id`). Backend + frontend UI. | — |
-| 9  | `fix/auth-mode-and-cookie-hardening` | F4 (login-s3 guard) + F7 (cookie DB check) + L1/L2/L3/L4/L5 (backend hardening bundle, minus L6/L7 which ride with F1). All small backend changes, ride together. | — |
-| 10 | `fix/oauth-provider-source` | F6 (per-provider `auth_source` + lazy upgrade). Backend only; decision needed first (§8). | — |
+| 9  | `fix/auth-mode-and-cookie-hardening` | F4 + F7 + L1(inline) + L2 + L4 + L5. **L3 dropped** (hardens fork-only `TrustedProxyMiddleware`; rides with Subject B). **✅ pushed `c32c407`** | — |
+| 10 | `fix/oauth-provider-source` | F6 (per-provider `auth_source` + lazy upgrade). Backend only. | — |
 
-Docs (on `main`, not in any PR): this design doc + `security-and-proxy-design.md` §4.A7/§9 status update (§7 of this doc), the `.env.example` SECURE_COOKIE fix (F5), the MCP security correction in `website/.../mcp.mdx`, and a short "MCP version pinning" operator note.
+> **Status (2026-07):** PRs 5, 6, 7, 9 pushed to `origin` (code-only, tests green); PRs 8 and 10 not started. **None opened upstream** — `gh` is unavailable in agent sessions; queued for the user to open via the GitHub compare UI. See §4.1.8 for the PR 6 outcome and §9 for the **un-upstreamed-stack** issue now concretely affecting L1/A8.
 
-PR 5 first (urgent, unblocks PR 6). PRs 7/8/9/10 are independent and can proceed in parallel after their respective decisions. PR 6 is the highest-risk and deserves its own focused review — **pause for the user** if the §4.1.7 spike finds the transport can't host per-request auth.
+Docs (on `main`, not in any PR): this design doc + `security-and-proxy-design.md` §4.A7 status update, the `.env.example` SECURE_COOKIE fix (F5), the `website/.../mcp.mdx` correction + `MCP_ALLOWED_ORIGINS`/TLS-proxy + version-pin operator notes. These operator docs land when the corresponding code merges to `main` (editing them now would create doc/code mismatch — the fixes are on PR branches, not `main`).
+
+PR 5 first (urgent, unblocks PR 6). PR 6 was the highest-risk and is done (spike PASSED, §4.1.8). PRs 8/10 remain. **The un-upstreamed-stack issue (§9) now affects sequencing of dependent fixes — decision needed.**
 
 ---
 
@@ -317,3 +317,31 @@ Estimated effort: PR 5 ≈ 15 min; PR 6 ≈ 1–2 days (spike-dependent); PRs 7/
 5. **PR 6 history.** Confirm the "fresh branch, don't touch the old merge" approach for the A7 re-do. (Recommend yes — the old merge carries Parquet.)
 6. **Git rights.** Local commit/push-to-origin are permitted; opening upstream PRs via `gh` and any force-push/rebase-on-shared-branch may need additional rights — flag when PR 5/6 are ready.
 7. **Timing.** PR 5 (the `<2` pin) is genuinely urgent — v2 stable is targeted 2026-07-28. If it slips, the MCP image breaks on the next build.
+
+---
+
+## 9. Un-upstreamed-stack issue (strategic — decision needed)
+
+**The problem, now concrete.** Fork `main` carries a large body of merged security work — PRs 1 (A1–A6/A8/A9), 2 (the *real* A7 = our PR 6), 3 (Subject B `TrustedProxyMiddleware` + audit `client_ip`), 4 (A8 `require_local_admin` + A9) — but **none of it has been merged into `AshwathStephen/sairo:main`** (which sits at `64bdb2f`, the v3.6.0 rollback). The fork policy of "cut every new PR from `upstream-main`" means each new PR re-derives from clean v3.6.0 and **cannot build on the prior fixes**, because those fixes don't exist upstream.
+
+This stopped being theoretical during PR 9:
+
+- **L3 had to be dropped** from PR 9 — it hardens `TrustedProxyMiddleware`, which doesn't exist on `upstream-main`. L3 now has to "ride with" the Subject B PR whenever that goes upstream.
+- **L1 had to use the inline `s3:` form** instead of `require_local_admin` (also fork-only upstream-pending).
+- **L1's tenant isolation is bypassable on the upstream base** (flagged by the PR 9 PM as a critical fast-follow): the A8 chain (`auth_create_user` → `auth_login` → mint a non-`s3:`-prefixed local admin) defeats L1, and A8 is only fixed on fork `main` (via `require_local_admin`), not on `upstream-main`. So a PR 9 merged upstream *before* PR 4 (A8) would ship a tenant-isolation feature that's bypassable by the very bug PR 4 already fixed on the fork. **L1 is only fully effective once A8 (`require_local_admin`) is also upstream.**
+
+In other words: the fork's PR-per-finding model is producing upstream PRs whose security guarantees **silently depend on other un-upstreamed PRs**. A reviewer (or an upstream user adopting just one PR) gets an incomplete picture.
+
+**Decision needed — pick an upstreaming strategy:**
+
+1. **Open the full stack upstream, in dependency order, and merge sequentially.** Prepare upstream PRs for 1 → 3 → 4 → 5 → 6 → 7 → 9 → 8 → 10 (each rebased on the previous). Reviewer sees a coherent series; L1/A8 and L3/Subject-B land in the right order. **Highest fidelity, most review effort.** Requires `gh` access (not currently available in agent sessions — needs the user).
+2. **Stack the PRs explicitly** (each PR's base = the prior PR's branch, opened as a stack via something like `gh pr create --base <prev-branch>`). Same ordering guarantee, makes the dependency visible to upstream reviewers. Same `gh` requirement.
+3. **Consolidate into fewer, larger upstream PRs** grouped by area (one "backend auth hardening" PR combining A8 + F4 + F7 + L1…; one "MCP auth" PR = PR 5+6; one "DB namespace" = PR 7; etc.). Less review ceremony, bigger diffs.
+4. **Treat the fork as the deployment and deprioritize upstreaming.** Stop cutting from `upstream-main`; develop directly on fork `main` (where all prior fixes exist), and upstream in bulk later or not at all. Lowest friction; abandons the "clean upstream PRs" goal.
+
+**Architect recommendation:** **(1) or (2)** — the security value of these fixes is only realized when they actually land upstream in the right order, and L1/A8 demonstrates that piecemeal upstreaming is actively dangerous (it ships bypassable partial fixes). The immediate blocker is **`gh` access / upstream PR opening** — none of PRs 5/6/7/9 can be opened from agent sessions. This needs the user (install `gh`, or open via the compare URLs provided).
+
+**Until the strategy is chosen, sequencerule for remaining work:**
+- **PR 8 (F3 endpoint-scoped perms) and PR 10 (F6 OAuth source)** are independent of the stack issue (they apply cleanly to v3.6.0) — they can proceed regardless.
+- **L3** is parked until Subject B goes upstream (or the strategy picks option 4).
+- The **A8↔L1 coupling** should be called out in PR 9's upstream PR description (the PM already drafted this in the PR 9 body) so an upstream reviewer merges A8 (PR 4) before or with PR 9.
