@@ -712,6 +712,10 @@ class TestSecurityHeaders:
         csp = resp.headers["content-security-policy"]
         assert "default-src 'self'" in csp
         assert "script-src 'self'" in csp
+        # Required for the duckdb-wasm SQL tab: without 'wasm-unsafe-eval' the
+        # browser blocks WebAssembly.instantiateStreaming() and the SQL tab
+        # hangs forever on its loading spinner.
+        assert "'wasm-unsafe-eval'" in csp
 
     def test_x_content_type_options(self, client):
         """All responses should include X-Content-Type-Options: nosniff."""

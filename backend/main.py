@@ -116,7 +116,7 @@ async def security_headers_middleware(request: Request, call_next):
     connect_src = ("connect-src 'self' " + _csp_connect_origins()).rstrip()
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
-        "script-src 'self'; "
+        "script-src 'self' 'wasm-unsafe-eval'; "
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com; "
         "img-src 'self' blob: data:; "
