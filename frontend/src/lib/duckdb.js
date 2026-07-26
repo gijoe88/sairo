@@ -7,8 +7,12 @@
 //   that lives in the initial bundle, or the WASM will leak into index-*.js.
 //   The Worker + WASM binaries below are imported via Vite's `?url` suffix so
 //   Vite emits them as separate hashed asset files (official duckdb-wasm Vite
-//   recipe). The EH (exception-handling) variant is used for best Parquet
-//   support.
+//   recipe). The MVP variant is used instead of EH (exception-handling): the
+//   EH build relies on the wasm exception-handling proposal whose `try`
+//   instruction is being deprecated by browsers in favor of `try_table`,
+//   which has caused unrelated fragility. MVP sidesteps that whole class of
+//   instability for ~5 MB extra download; parquet support is identical across
+//   variants.
 //
 // Lifecycle:
 //   getDuckDB()  → instantiates AsyncDuckDB + a long-lived connection once,
@@ -22,9 +26,9 @@
 import { AsyncDuckDB, ConsoleLogger } from "@duckdb/duckdb-wasm";
 // Worker file format note (MUST-FIX 1, verified empirically against
 // @duckdb/duckdb-wasm@1.32.0):
-//   The imported file `dist/duckdb-browser-eh.worker.js` is a PREDIGESTED
+//   The imported file `dist/duckdb-browser-mvp.worker.js` is a PREDIGESTED
 //   CLASSIC worker bundle, NOT an ES module. Evidence:
-//     - `head -c 800 .../duckdb-browser-eh.worker.js` begins with
+//     - `head -c 800 .../duckdb-browser-mvp.worker.js` begins with
 //       `"use strict";var duckdb=(()=>{...` (IIFE, no top-level import/export).
 //     - `grep -c '^import\|^export'` over the file returns 0; the only
 //       occurrences of the words "import"/"export" are inside string literals
@@ -35,10 +39,10 @@ import { AsyncDuckDB, ConsoleLogger } from "@duckdb/duckdb-wasm";
 //   Therefore the Worker is constructed WITHOUT a `type` option. Passing
 //   `{type:"module"}` to a classic worker throws `SyntaxError` at runtime, and
 //   keeping the default (classic) is the only correct combination for this file.
-//   If a future duckdb-wasm release ships `duckdb-browser-eh.worker.mjs`,
+//   If a future duckdb-wasm release ships `duckdb-browser-mvp.worker.mjs`,
 //   switch the import and add `{ type: "module" }`.
-import workerUrl from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url";
-import wasmUrl from "@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url";
+import workerUrl from "@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url";
+import wasmUrl from "@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url";
 
 // Module-level singleton state. `_db`/`_conn` are reused for the session;
 // `_registered` tracks view names so reset() can clean them up.
